@@ -1,8 +1,18 @@
 # =========================================================
-# GPT 1.0.0
+# каждый час — редактируется текущий пост
+# 00:00 — создаётся новый пост и его message_id сохраняется
+# после 00:00 — обновляется уже новый пост
+# /weather — ручное обновление из Telegram
+# python weather_bot.py now — ручное обновление из cmd 
+# | 1.1.0
 # =========================================================
 
+
+
+
+
 import os
+import sys
 import time
 import math
 import requests
@@ -16,7 +26,7 @@ from pyluach.dates import HebrewDate
 # НАСТРОЙКИ
 # =========================================================
 
-BOT_TOKEN = "8843774698:AAFLs9BUlDFJBCDhCuET66p9bzt9qdZKdgM"
+BOT_TOKEN = "8843774698:AAGoaYTS4zask-N9HtesZ2v9pbx_1MCrbLY"
 CHANNEL = "@ne_zaika"
 
 
@@ -27,7 +37,7 @@ LON = 34.9896
 TZ = ZoneInfo("Asia/Jerusalem")
 
 # Раз в час
-UPDATE_INTERVAL = 3600
+# UPDATE_INTERVAL = 3600
 
 # Здесь запоминаем Telegram message_id
 MESSAGE_ID_FILE = "weather_message_id.txt"
@@ -651,6 +661,80 @@ def edit_message(message_id, text):
         ):
             raise RuntimeError(result)
 
+# =========================================================
+# ПУШ через ТГ
+# =========================================================
+
+def check_telegram_commands(offset=None):
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/getUpdates"
+    )
+
+    params = {
+        "timeout": 0,
+        "limit": 10
+    }
+
+    if offset is not None:
+        params["offset"] = offset
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=10
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        return offset
+
+    for update in data.get("result", []):
+        update_id = update["update_id"]
+        offset = update_id + 1
+
+        message = update.get("message")
+
+        if not message:
+            continue
+
+        text = message.get(
+            "text",
+            ""
+        ).strip().lower()
+
+        if text == "/weather":
+            message_id = load_message_id()
+            weather_text = make_text()
+
+            if message_id is None:
+                message_id = send_message(
+                    weather_text
+                )
+                save_message_id(
+                    message_id
+                )
+            else:
+                edit_message(
+                    message_id,
+                    weather_text
+                )
+
+            chat_id = message["chat"]["id"]
+
+            requests.post(
+                f"https://api.telegram.org/"
+                f"bot{BOT_TOKEN}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": "Погода обновлена."
+                },
+                timeout=10
+            )
+
+    return offset
 
 # =========================================================
 # MESSAGE ID
@@ -691,6 +775,35 @@ def save_message_id(message_id):
             str(message_id)
         )
 
+# =========================================================
+# ОПРЕДЕЛЕНИЕ КРУГЛОГО ВРЕМЕНИ
+# =========================================================
+
+def wait_until_next_hour(telegram_offset):
+    now = datetime.now(TZ)
+
+    target = (
+        now.replace(
+          minute=0,
+            second=0,
+            microsecond=0
+        )
+        + timedelta(hours=1)
+# + timedelta(minutes=1)
+    )
+
+    while True:
+        now = datetime.now(TZ)
+        seconds = (target - now).total_seconds()
+
+        if seconds <= 0:
+            return telegram_offset
+
+        telegram_offset = check_telegram_commands(
+            telegram_offset
+        )
+
+        time.sleep(min(5, seconds))
 
 # =========================================================
 # ОСНОВНОЙ ЦИКЛ
@@ -699,12 +812,37 @@ def save_message_id(message_id):
 def main():
 
     message_id = load_message_id()
+    telegram_offset = None
 
     while True:
 
         try:
 
+            telegram_offset = check_telegram_commands(
+                telegram_offset
+            )
+
             text = make_text()
+
+# Новый пост в ПОЛНОЧЬ
+
+now = datetime.now(TZ)
+
+if now.hour == 0 and now.minute == 0:
+    message_id = send_message(text)
+    save_message_id(message_id)
+
+    print(
+        "Создан новый суточный погодный пост:",
+        message_id
+    )
+
+    telegram_offset = wait_until_next_hour(
+        telegram_offset
+    )
+
+    continue
+# 
 
             if message_id is None:
 
@@ -730,9 +868,7 @@ def main():
 
                 print(
                     "Погодный пост обновлён:",
-                    datetime.now(TZ).strftime(
-                        "%H:%M"
-                    )
+                    datetime.now(TZ).strftime("%H:%M")
                 )
 
         except Exception as error:
@@ -742,10 +878,27 @@ def main():
                 error
             )
 
-        time.sleep(
-            UPDATE_INTERVAL
+        telegram_offset = wait_until_next_hour(
+            telegram_offset
         )
 
 
+# =========================================================
+# ПУШ через cmd
+# =========================================================
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "now":
+        message_id = load_message_id()
+        text = make_text()
+
+        if message_id is None:
+            message_id = send_message(text)
+            save_message_id(message_id)
+            print("Создан новый погодный пост:", message_id)
+        else:
+            edit_message(message_id, text)
+            print("Погодный пост принудительно обновлён.")
+
+    else:
+        main()
