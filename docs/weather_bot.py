@@ -1,6 +1,6 @@
 # =========================================================
-# РАНЖИРЫ 
-# | 1.2.0
+# РАНЖИРЫ + АвтоОбновление
+# | 1.3.0
 # =========================================================
 
 
@@ -167,46 +167,47 @@ def format_delta(delta):
 # =========================================================
 
 def moon_phase(now):
-    # известная эпоха новолуния
-    epoch = datetime(
-        2000, 1, 6, 18, 14,
-        tzinfo=timezone.utc
-    )
-
+    epoch = datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)
     synodic_month = 29.53058867
-
     now_utc = now.astimezone(timezone.utc)
 
-    days = (
-        now_utc - epoch
-    ).total_seconds() / 86400
-
+    days = (now_utc - epoch).total_seconds() / 86400
     age = days % synodic_month
     fraction = age / synodic_month
 
+    illumination = (
+        1 - math.cos(2 * math.pi * fraction)
+    ) / 2 * 100
+
     if fraction < 0.03 or fraction >= 0.97:
-        return "🌑 новолуние"
-
+        phase = "🌑 новолуние"
+        visibility = "практически не видна"
     elif fraction < 0.22:
-        return "🌒 растущая Луна"
-
+        phase = "🌒 растущий серп"
+        visibility = "лучше видна вечером"
     elif fraction < 0.28:
-        return "🌓 первая четверть"
-
+        phase = "🌓 первая четверть"
+        visibility = "хорошо видна вечером"
     elif fraction < 0.47:
-        return "🌔 растущая Луна"
-
+        phase = "🌔 растущая Луна"
+        visibility = "хорошо видна вечером и ночью"
     elif fraction < 0.53:
-        return "🌕 полнолуние"
-
+        phase = "🌕 полнолуние"
+        visibility = "видна почти всю ночь"
     elif fraction < 0.72:
-        return "🌖 убывающая Луна"
-
+        phase = "🌖 убывающая Луна"
+        visibility = "лучше видна ночью и утром"
     elif fraction < 0.78:
-        return "🌗 последняя четверть"
-
+        phase = "🌗 последняя четверть"
+        visibility = "лучше видна после полуночи и утром"
     else:
-        return "🌘 убывающая Луна"
+        phase = "🌘 убывающий серп"
+        visibility = "лучше виден перед рассветом"
+
+    return (
+        f"{phase}, освещено {illumination:.0f}% — "
+        f"{visibility}"
+    )
 
 
 # =========================================================
@@ -215,50 +216,97 @@ def moon_phase(now):
 
 def kp_description(kp):
     if kp < 2:
-        return "спокойно"
-
-    if kp < 4:
+        return "спокойное"
+    elif kp < 3:
+        return "слабо возмущённое"
+    elif kp < 4:
         return "небольшие возмущения"
-
-    if kp < 5:
-        return "возмущённое поле"
-
-    if kp < 6:
-        return "магнитная буря G1"
-
-    if kp < 7:
-        return "магнитная буря G2"
-
-    if kp < 8:
-        return "магнитная буря G3"
-
-    if kp < 9:
-        return "магнитная буря G4"
-
-    return "магнитная буря G5"
+    elif kp < 5:
+        return "возмущённое, но магнитной бури нет"
+    elif kp < 6:
+        return "G1 — слабая магнитная буря"
+    elif kp < 7:
+        return "G2 — умеренная магнитная буря"
+    elif kp < 8:
+        return "G3 — сильная магнитная буря"
+    elif kp < 9:
+        return "G4 — очень сильная магнитная буря"
+    else:
+        return "G5 — экстремальная магнитная буря"
 
 
 def get_kp():
-    url = (
-        "https://services.swpc.noaa.gov/"
-        "products/noaa-planetary-k-index.json"
-    )
+
+    # =====================================================
+    # 1. NOAA
+    # =====================================================
 
     try:
+        url = (
+            "https://services.swpc.noaa.gov/"
+            "json/planetary_k_index_1m.json"
+        )
+
         data = get_json(url)
 
-        # первая строка — заголовки
-        rows = data[1:]
+        if data:
+            last = data[-1]
 
-        last = rows[-1]
+            kp = last.get("kp_index")
 
-        kp = float(last[1])
+            if kp is None:
+                kp = last.get("estimated_kp")
 
-        return kp
+            if kp is not None:
+                print("Kp источник: NOAA")
+                return float(kp)
 
-    except Exception:
-        return None
+    except Exception as error:
+        print("NOAA Kp ошибка:", error)
 
+
+    # =====================================================
+    # 2. GFZ POTSDAM
+    # =====================================================
+
+    try:
+        now_utc = datetime.now(timezone.utc)
+
+        start_utc = now_utc - timedelta(hours=24)
+
+        start = start_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        end = now_utc.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        url = (
+            "https://kp.gfz.de/app/json/"
+            f"?start={start}"
+            f"&end={end}"
+            "&index=Kp"
+        )
+
+        data = get_json(url)
+
+        # GFZ возвращает массив значений Kp
+        kp_values = data.get("Kp", [])
+
+        if kp_values:
+            kp = float(kp_values[-1])
+
+            print("Kp источник: GFZ")
+            return kp
+
+    except Exception as error:
+        print("GFZ Kp ошибка:", error)
+
+
+    print("Kp: данные не получены ни от NOAA, ни от GFZ")
+
+    return None
 
 # =========================================================
 # СОЛНЕЧНАЯ АКТИВНОСТЬ
@@ -857,8 +905,6 @@ def make_text():
 
         f"{special_text}\n\n"
 
-        f"☀️ УФ-индекс: {uv:.1f} — {uv_text}\n"
-
         f"🌫 Пустынная пыль: "
         f"{dust:.1f} мкг/м³ — {dust_text}\n"
 
@@ -878,7 +924,8 @@ def make_text():
 
         f"🌙 Луна: {moon}\n"
         f"{magnetic_text}\n"
-        f"{solar_text}\n\n"
+        f"{solar_text}\n"
+        f"☀️ УФ-индекс: {uv:.1f} — {uv_text}\n\n"
 
         f"🕒 Обновлено: "
         f"{now.strftime('%H:%M')}\n\n"
@@ -1068,37 +1115,7 @@ def save_message_id(message_id):
         )
 
 # =========================================================
-# ОПРЕДЕЛЕНИЕ КРУГЛОГО ВРЕМЕНИ
-# =========================================================
-
-def wait_until_next_hour(telegram_offset):
-    now = datetime.now(TZ)
-
-    target = (
-        now.replace(
-          minute=0,
-            second=0,
-            microsecond=0
-        )
-        + timedelta(hours=1)
-# + timedelta(minutes=1)
-    )
-
-    while True:
-        now = datetime.now(TZ)
-        seconds = (target - now).total_seconds()
-
-        if seconds <= 0:
-            return telegram_offset
-
-        telegram_offset = check_telegram_commands(
-            telegram_offset
-        )
-
-        time.sleep(min(5, seconds))
-
-# =========================================================
-# ОСНОВНОЙ ЦИКЛ
+# ОСНОВНОЙ ЦИКЛ — АВТООБНОВЛЕНИЕ КАЖДЫЙ РОВНЫЙ ЧАС
 # =========================================================
 
 def main():
@@ -1106,59 +1123,116 @@ def main():
     message_id = load_message_id()
     telegram_offset = None
 
+    # При запуске сразу обновляем текущий пост
+    try:
+        text = make_text()
+        now = datetime.now(TZ)
+
+        if message_id is None:
+            message_id = send_message(text)
+            save_message_id(message_id)
+            print(
+                "Создан погодный пост:",
+                message_id
+            )
+        else:
+            edit_message(
+                message_id,
+                text
+            )
+            print(
+                "Погодный пост обновлён при запуске:",
+                now.strftime("%H:%M")
+            )
+
+    except Exception as error:
+        print(
+            "ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
+    # Запоминаем, какой час уже обработан
+    last_auto_hour = datetime.now(TZ).strftime(
+        "%Y-%m-%d %H"
+    )
+
+    print(
+        "Следующее автоматическое обновление после смены часа."
+    )
+
     while True:
 
         try:
+            # Команда /weather из Telegram
             telegram_offset = check_telegram_commands(
                 telegram_offset
             )
 
-            text = make_text()
             now = datetime.now(TZ)
+            current_hour = now.strftime(
+                "%Y-%m-%d %H"
+            )
 
-            # Новый пост в ПОЛНОЧЬ
-            if now.hour == 0 and now.minute == 0:
+            # Час сменился — выполняем автоматическое обновление.
+            # Даже если компьютер/сеть задержали цикл на минуту-другую,
+            # обновление не будет пропущено.
+            if current_hour != last_auto_hour:
 
-                message_id = send_message(text)
-                save_message_id(message_id)
+                text = make_text()
 
-                print(
-                    "Создан новый суточный погодный пост:",
-                    message_id
-                )
+                # В 00 часов создаём НОВЫЙ суточный пост
+                if now.hour == 0:
+                    message_id = send_message(
+                        text
+                    )
+                    save_message_id(
+                        message_id
+                    )
 
-            elif message_id is None:
+                    print(
+                        "Создан новый суточный погодный пост:",
+                        message_id,
+                        now.strftime("%H:%M")
+                    )
 
-                message_id = send_message(text)
-                save_message_id(message_id)
+                else:
+                    if message_id is None:
+                        message_id = load_message_id()
 
-                print(
-                    "Создан погодный пост:",
-                    message_id
-                )
+                    if message_id is None:
+                        message_id = send_message(
+                            text
+                        )
+                        save_message_id(
+                            message_id
+                        )
 
-            else:
+                        print(
+                            "Создан погодный пост:",
+                            message_id
+                        )
+                    else:
+                        edit_message(
+                            message_id,
+                            text
+                        )
 
-                edit_message(
-                    message_id,
-                    text
-                )
+                        print(
+                            "Автоматическое обновление:",
+                            now.strftime("%H:%M")
+                        )
 
-                print(
-                    "Погодный пост обновлён:",
-                    now.strftime("%H:%M")
-                )
+                last_auto_hour = current_hour
 
         except Exception as error:
-
             print(
-                "ОШИБКА:",
+                "ОШИБКА АВТООБНОВЛЕНИЯ:",
                 error
             )
 
-        telegram_offset = wait_until_next_hour(
-            telegram_offset
-        )
+        # Проверяем время и Telegram-команды каждые 1 минуту
+        time.sleep(60)
+
 
 # =========================================================
 # ПУШ через cmd
