@@ -1,6 +1,6 @@
 # =========================================================
-# Фикс ПушОбновления
-# | 2.0.3
+# Фикс БотОбновления
+# | 2.0.4
 # =========================================================
 
 
@@ -28,6 +28,16 @@ TZ = ZoneInfo("Asia/Jerusalem")
 
 # Общий цикл диспетчера: одна проверка в минуту.
 SCHEDULER_INTERVAL = 60
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+def state_file(name):
+    return os.path.join(
+        BASE_DIR,
+        name
+    )
 
 
 # =========================================================
@@ -87,22 +97,18 @@ def edit_message(message_id, text):
         timeout=30,
     )
 
+    response.raise_for_status()
     result = response.json()
 
-    # Telegram возвращает ошибку, если текст
-    # полностью совпадает с предыдущим.
     if not result.get("ok"):
+        raise RuntimeError(result)
 
-        description = result.get(
-            "description",
-            ""
-        )
+    edited = result.get("result", {})
 
-        if (
-            "message is not modified"
-            not in description.lower()
-        ):
-            raise RuntimeError(result)
+    return edited.get(
+        "message_id",
+        message_id
+    )
 
 
 def load_id_file(filename):
@@ -179,8 +185,8 @@ def update_persistent_post(text, filename):
 LAT = 32.7940
 LON = 34.9896
 
-WEATHER_MESSAGE_ID_FILE = "weather_message_id.txt"
-WEATHER_SLOT_FILE = "weather_slot.txt"
+WEATHER_MESSAGE_ID_FILE = state_file("weather_message_id.txt")
+WEATHER_SLOT_FILE = state_file("weather_slot.txt")
 
 
 # ---------------------------------------------------------
@@ -1101,14 +1107,16 @@ def update_weather(force_new=False):
             now.strftime("%H:%M")
         )
     else:
-        edit_message(
+        message_id = edit_message(
             message_id,
             text
         )
 
         print(
             "ПОГОДА: обновлено:",
-            now.strftime("%H:%M")
+            now.strftime("%H:%M:%S"),
+            "message_id:",
+            message_id
         )
 
     return message_id
@@ -1143,9 +1151,9 @@ FLIGHTS_RESOURCE_ID = (
 
 FLIGHTS_UPDATE_INTERVAL = 600
 
-ARRIVALS_MESSAGE_ID_FILE = "arrivals_message_id.txt"
-DEPARTURES_MESSAGE_ID_FILE = "departures_message_id.txt"
-FLIGHT_ALERTS_MESSAGE_ID_FILE = "flight_alerts_message_id.txt"
+ARRIVALS_MESSAGE_ID_FILE = state_file("arrivals_message_id.txt")
+DEPARTURES_MESSAGE_ID_FILE = state_file("departures_message_id.txt")
+FLIGHT_ALERTS_MESSAGE_ID_FILE = state_file("flight_alerts_message_id.txt")
 
 
 # ---------------------------------------------------------
@@ -1617,10 +1625,15 @@ def check_telegram_commands(offset=None):
 
         try:
             if command == "/weather":
-                update_weather()
+                weather_message_id = update_weather()
+
                 send_private_reply(
                     chat_id,
-                    "Погода обновлена."
+                    (
+                        "Погода реально обновлена. "
+                        f"Пост #{weather_message_id}. "
+                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
+                    )
                 )
 
             elif command == "/arrivals":
@@ -1712,6 +1725,14 @@ def main():
     # =====================================================
 
     print("ДИСПЕТЧЕР ЗАПУСКАЕТСЯ...")
+    print(
+        "Файл текущего погодного message_id:",
+        WEATHER_MESSAGE_ID_FILE
+    )
+    print(
+        "Текущий погодный message_id:",
+        load_id_file(WEATHER_MESSAGE_ID_FILE)
+    )
 
     try:
         update_weather()
