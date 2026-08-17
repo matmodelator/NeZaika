@@ -1,9 +1,6 @@
 # =========================================================
-# Погода теперь ждёт конкретный следующий ровный час через next_weather_update. Если цикл проснулся в 05:01, обновление всё равно выполнится и следующий срок будет 06:00, а не 06:01.
-Переносы рейсов теперь показываются нормально:
-+35 мин, +1 ч 20 мин, +2 ч.
-В строку рейса добавлена авиакомпания через CHOPERD.
-# | 2.0.1
+# Фикс Автообновления
+# | 2.0.2
 # =========================================================
 
 
@@ -1694,76 +1691,52 @@ def check_telegram_commands(offset=None):
 # Ошибка одного сервиса НЕ останавливает второй.
 # =========================================================
 
-def next_full_hour(now):
+def weather_schedule_key(now):
+    return now.strftime("%Y-%m-%d %H")
+
+
+def flights_schedule_key(now):
+    ten_minute = (now.minute // 10) * 10
+
     return (
-        now.replace(
-            minute=0,
-            second=0,
-            microsecond=0
-        )
-        + timedelta(hours=1)
+        now.strftime("%Y-%m-%d %H:")
+        + f"{ten_minute:02d}"
     )
 
 
 def main():
     telegram_offset = None
 
-    # ----- ПОГОДА: старт -----
-    try:
-        update_weather()
-    except Exception as error:
-        print(
-            "ПОГОДА — ОШИБКА ПРИ ЗАПУСКЕ:",
-            error
-        )
+    now = datetime.now(TZ)
 
-    # Следующее гарантированное часовое обновление.
-    next_weather_update = next_full_hour(
-        datetime.now(TZ)
-    )
+    # Текущий час и текущий 10-минутный интервал
+    # считаем уже обработанными при запуске.
+    last_weather_key = weather_schedule_key(now)
+    last_flights_key = flights_schedule_key(now)
 
-    # ----- БЕН-ГУРИОН: старт -----
-    try:
-        update_flight_board()
-        last_flights_update = time.time()
-    except Exception as error:
-        print(
-            "БЕН-ГУРИОН — ОШИБКА ПРИ ЗАПУСКЕ:",
-            error
-        )
-        last_flights_update = 0
-
+    print("ДИСПЕТЧЕР ЗАПУЩЕН.")
+    print("Погода: автоматически при смене часа.")
     print(
-        "ДИСПЕТЧЕР ЗАПУЩЕН:",
-        "погода — каждый час;",
-        "Бен-Гурион — каждые 10 минут."
+        "Бен-Гурион: автоматически в "
+        "00, 10, 20, 30, 40 и 50 минут."
     )
 
     while True:
 
-        # ---------------------------------------------
-        # TELEGRAM-КОМАНДЫ
-        # ---------------------------------------------
-        try:
-            telegram_offset = (
-                check_telegram_commands(
-                    telegram_offset
-                )
-            )
-        except Exception as error:
-            print(
-                "TELEGRAM — ОШИБКА:",
-                error
-            )
-
         now = datetime.now(TZ)
 
         # ---------------------------------------------
-        # ПОГОДА — НЕЗАВИСИМЫЙ ТАЙМЕР
+        # ПОГОДА — ПРИ СМЕНЕ ЧАСА
         # ---------------------------------------------
-        if now >= next_weather_update:
+        current_weather_key = weather_schedule_key(now)
+
+        if current_weather_key != last_weather_key:
             try:
                 update_weather()
+
+                # Только успешное обновление закрывает час.
+                # При ошибке повторим через минуту.
+                last_weather_key = current_weather_key
 
                 print(
                     "ПОГОДА — АВТООБНОВЛЕНИЕ:",
@@ -1777,26 +1750,22 @@ def main():
                     error
                 )
 
-            # ВАЖНО:
-            # даже если обновление произошло с задержкой,
-            # назначаем следующий РОВНЫЙ час,
-            # а не "+1 час от текущего времени".
-            next_weather_update = next_full_hour(
-                datetime.now(TZ)
-            )
+        # ---------------------------------------------
+        # БЕН-ГУРИОН — КАЖДЫЕ 10 МИНУТ ПО ЧАСАМ
+        # ---------------------------------------------
+        current_flights_key = flights_schedule_key(now)
 
-        # ---------------------------------------------
-        # БЕН-ГУРИОН — НЕЗАВИСИМЫЙ ТАЙМЕР
-        # ---------------------------------------------
-        if (
-            time.time() - last_flights_update
-            >= FLIGHTS_UPDATE_INTERVAL
-        ):
+        if current_flights_key != last_flights_key:
             try:
                 update_flight_board()
 
-                last_flights_update = (
-                    time.time()
+                # Только успешное обновление закрывает интервал.
+                # При ошибке повторим через минуту.
+                last_flights_key = current_flights_key
+
+                print(
+                    "БЕН-ГУРИОН — АВТООБНОВЛЕНИЕ:",
+                    now.strftime("%H:%M")
                 )
 
             except Exception as error:
@@ -1807,9 +1776,22 @@ def main():
                 )
 
         # ---------------------------------------------
-        # ОБЩИЙ ТИК ДИСПЕТЧЕРА
+        # TELEGRAM-КОМАНДЫ
         # ---------------------------------------------
-        time.sleep(SCHEDULER_INTERVAL)
+        try:
+            telegram_offset = check_telegram_commands(
+                telegram_offset
+            )
+
+        except Exception as error:
+            print(
+                "TELEGRAM — ОШИБКА:",
+                error
+            )
+
+        # Диспетчер просыпается раз в минуту.
+        # Погода при этом НЕ запрашивается каждую минуту.
+        time.sleep(60)
 
 
 # =========================================================
