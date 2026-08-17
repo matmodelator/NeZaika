@@ -1,5 +1,5 @@
 # =========================================================
-# Фикс Автообновления
+# Фикс ПушОбновления
 # | 2.0.2
 # =========================================================
 
@@ -1024,7 +1024,7 @@ def make_weather_text():
         f"☀️ УФ-индекс: {uv:.1f} — {uv_text}\n\n"
 
         f"🕒 Обновлено: "
-        f"{now.strftime('%H:%M')}\n\n"
+        f"{now.strftime('%H:%M:%S')}\n\n"
 
         "@ne_zaika"
     )
@@ -1412,7 +1412,7 @@ def make_flights_text(
 
     lines.extend([
         "",
-        f"🕒 Обновлено: {now.strftime('%H:%M')}",
+        f"🕒 Обновлено: {now.strftime('%H:%M:%S')}",
         "",
         "@ne_zaika",
     ])
@@ -1495,7 +1495,7 @@ def make_flight_alerts_text(flights):
 
     lines.extend([
         "",
-        f"🕒 Обновлено: {now.strftime('%H:%M')}",
+        f"🕒 Обновлено: {now.strftime('%H:%M:%S')}",
         "",
         "@ne_zaika",
     ])
@@ -1707,18 +1707,47 @@ def flights_schedule_key(now):
 def main():
     telegram_offset = None
 
+    # =====================================================
+    # СТАРТ СЕРВЕРА — СРАЗУ ОБНОВЛЯЕМ ВСЁ
+    # =====================================================
+
+    print("ДИСПЕТЧЕР ЗАПУСКАЕТСЯ...")
+
+    try:
+        update_weather()
+        print(
+            "ПОГОДА — ОБНОВЛЕНА ПРИ ЗАПУСКЕ:",
+            datetime.now(TZ).strftime("%H:%M:%S")
+        )
+    except Exception as error:
+        print(
+            "ПОГОДА — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
+    try:
+        update_flight_board()
+        print(
+            "БЕН-ГУРИОН — ОБНОВЛЕН ПРИ ЗАПУСКЕ:",
+            datetime.now(TZ).strftime("%H:%M:%S")
+        )
+    except Exception as error:
+        print(
+            "БЕН-ГУРИОН — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
     now = datetime.now(TZ)
 
-    # Текущий час и текущий 10-минутный интервал
-    # считаем уже обработанными при запуске.
+    # Текущие интервалы считаем обработанными ИМЕННО ПОСЛЕ
+    # стартового обновления.
     last_weather_key = weather_schedule_key(now)
     last_flights_key = flights_schedule_key(now)
 
     print("ДИСПЕТЧЕР ЗАПУЩЕН.")
-    print("Погода: автоматически при смене часа.")
+    print("Погода: при смене часа.")
     print(
-        "Бен-Гурион: автоматически в "
-        "00, 10, 20, 30, 40 и 50 минут."
+        "Бен-Гурион: в 00, 10, 20, 30, 40 и 50 минут."
     )
 
     while True:
@@ -1734,13 +1763,11 @@ def main():
             try:
                 update_weather()
 
-                # Только успешное обновление закрывает час.
-                # При ошибке повторим через минуту.
                 last_weather_key = current_weather_key
 
                 print(
                     "ПОГОДА — АВТООБНОВЛЕНИЕ:",
-                    now.strftime("%H:%M")
+                    datetime.now(TZ).strftime("%H:%M:%S")
                 )
 
             except Exception as error:
@@ -1751,7 +1778,7 @@ def main():
                 )
 
         # ---------------------------------------------
-        # БЕН-ГУРИОН — КАЖДЫЕ 10 МИНУТ ПО ЧАСАМ
+        # БЕН-ГУРИОН — СТРОГО ПО ДЕСЯТКАМ МИНУТ
         # ---------------------------------------------
         current_flights_key = flights_schedule_key(now)
 
@@ -1759,13 +1786,11 @@ def main():
             try:
                 update_flight_board()
 
-                # Только успешное обновление закрывает интервал.
-                # При ошибке повторим через минуту.
                 last_flights_key = current_flights_key
 
                 print(
                     "БЕН-ГУРИОН — АВТООБНОВЛЕНИЕ:",
-                    now.strftime("%H:%M")
+                    datetime.now(TZ).strftime("%H:%M:%S")
                 )
 
             except Exception as error:
@@ -1790,7 +1815,8 @@ def main():
             )
 
         # Диспетчер просыпается раз в минуту.
-        # Погода при этом НЕ запрашивается каждую минуту.
+        # Погода запрашивается только при смене часа.
+        # Бен-Гурион — только при новом 10-минутном интервале.
         time.sleep(60)
 
 
