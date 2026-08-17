@@ -1,6 +1,6 @@
 # =========================================================
-# РАНЖИРЫ + АвтоОбновление
-# | 1.3.0
+# Блочная структура: погода + Бен Гурион
+# | 2.0.0
 # =========================================================
 
 
@@ -18,28 +18,20 @@ from pyluach.dates import HebrewDate
 
 
 # =========================================================
-# НАСТРОЙКИ
+# 0. ОБЩИЕ НАСТРОЙКИ
 # =========================================================
 
 BOT_TOKEN = "8843774698:AAGoaYTS4zask-N9HtesZ2v9pbx_1MCrbLY"
 CHANNEL = "@ne_zaika"
 
-
-# Хайфа
-LAT = 32.7940
-LON = 34.9896
-
 TZ = ZoneInfo("Asia/Jerusalem")
 
-# Раз в час
-# UPDATE_INTERVAL = 3600
-
-# Здесь запоминаем Telegram message_id
-MESSAGE_ID_FILE = "weather_message_id.txt"
+# Общий цикл диспетчера: одна проверка в минуту.
+SCHEDULER_INTERVAL = 60
 
 
 # =========================================================
-# HTTP
+# 0.1. ОБЩИЕ HTTP-ФУНКЦИИ
 # =========================================================
 
 def get_json(url):
@@ -49,8 +41,151 @@ def get_json(url):
 
 
 # =========================================================
-# НАПРАВЛЕНИЕ ВЕТРА
+# 0.2. ОБЩИЕ TELEGRAM-ФУНКЦИИ
 # =========================================================
+
+def send_message(text):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHANNEL,
+            "text": text,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    return result["result"]["message_id"]
+
+
+def edit_message(message_id, text):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/editMessageText"
+    )
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHANNEL,
+            "message_id": message_id,
+            "text": text,
+        },
+        timeout=30,
+    )
+
+    result = response.json()
+
+    # Telegram возвращает ошибку, если текст
+    # полностью совпадает с предыдущим.
+    if not result.get("ok"):
+
+        description = result.get(
+            "description",
+            ""
+        )
+
+        if (
+            "message is not modified"
+            not in description.lower()
+        ):
+            raise RuntimeError(result)
+
+
+def load_id_file(filename):
+    if not os.path.exists(filename):
+        return None
+
+    try:
+        with open(
+            filename,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return int(file.read().strip())
+
+    except Exception:
+        return None
+
+
+def save_id_file(filename, message_id):
+    with open(
+        filename,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        file.write(str(message_id))
+
+
+def update_persistent_post(text, filename):
+    message_id = load_id_file(filename)
+
+    if message_id is None:
+        message_id = send_message(text)
+        save_id_file(filename, message_id)
+        return message_id
+
+    try:
+        edit_message(message_id, text)
+        return message_id
+
+    except Exception as error:
+        # Если постоянный пост был удалён вручную,
+        # создаём новый и запоминаем новый message_id.
+        description = str(error).lower()
+
+        if (
+            "message to edit not found" in description
+            or "message can't be edited" in description
+            or "message_id_invalid" in description
+        ):
+            message_id = send_message(text)
+            save_id_file(filename, message_id)
+            return message_id
+
+        raise
+
+
+# =========================================================
+# 1. ПОГОДА — ХАЙФА
+# =========================================================
+# Независимый сервис.
+#
+# Публикация:
+#   00:00 — новый погодный пост
+#   01:00–11:00 — редактируется текущий пост
+#   12:00 — новый погодный пост
+#   13:00–23:00 — редактируется текущий пост
+#
+# Принудительное обновление:
+#   Telegram: /weather
+#   CMD:      python weather_bot.py now
+# =========================================================
+
+# Хайфа
+LAT = 32.7940
+LON = 34.9896
+
+WEATHER_MESSAGE_ID_FILE = "weather_message_id.txt"
+WEATHER_SLOT_FILE = "weather_slot.txt"
+
+
+# ---------------------------------------------------------
+# 1.1. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПОГОДЫ
+# ---------------------------------------------------------
 
 def wind_direction(degrees):
     directions = [
@@ -67,10 +202,6 @@ def wind_direction(degrees):
     index = round(degrees / 45) % 8
     return directions[index]
 
-
-# =========================================================
-# ЕВРЕЙСКАЯ ДАТА
-# =========================================================
 
 HEBREW_MONTHS = {
     "Nissan": "нисана",
@@ -114,10 +245,6 @@ def get_hebrew_date(now_local, sunset_today):
     return f"{hebrew.day} {month_ru} {hebrew.year}"
 
 
-# =========================================================
-# ГРИГОРИАНСКАЯ ДАТА
-# =========================================================
-
 MONTHS_RU = [
     "",
     "января",
@@ -143,10 +270,6 @@ def gregorian_date_ru(d):
     )
 
 
-# =========================================================
-# ВРЕМЯ ДО СОБЫТИЯ
-# =========================================================
-
 def format_delta(delta):
     seconds = int(delta.total_seconds())
 
@@ -162,9 +285,9 @@ def format_delta(delta):
     return f"{minutes} мин"
 
 
-# =========================================================
-# ФАЗА ЛУНЫ
-# =========================================================
+# ---------------------------------------------------------
+# 1.2. ЛУНА / МАГНИТНОЕ ПОЛЕ / СОЛНЕЧНАЯ АКТИВНОСТЬ
+# ---------------------------------------------------------
 
 def moon_phase(now):
     epoch = datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)
@@ -209,10 +332,6 @@ def moon_phase(now):
         f"{visibility}"
     )
 
-
-# =========================================================
-# МАГНИТНАЯ ОБСТАНОВКА
-# =========================================================
 
 def kp_description(kp):
     if kp < 2:
@@ -308,9 +427,6 @@ def get_kp():
 
     return None
 
-# =========================================================
-# СОЛНЕЧНАЯ АКТИВНОСТЬ
-# =========================================================
 
 def get_solar_activity():
     url = (
@@ -342,9 +458,9 @@ def get_solar_activity():
     return None
 
 
-# =========================================================
-# ПОГОДА
-# =========================================================
+# ---------------------------------------------------------
+# 1.3. ИСТОЧНИКИ ПОГОДНЫХ ДАННЫХ
+# ---------------------------------------------------------
 
 def get_weather():
 
@@ -377,10 +493,6 @@ def get_weather():
     return get_json(url)
 
 
-# =========================================================
-# МОРЕ
-# =========================================================
-
 def get_marine():
 
     url = (
@@ -396,10 +508,6 @@ def get_marine():
 
     return get_json(url)
 
-
-# =========================================================
-# ВОЗДУХ
-# =========================================================
 
 def get_air():
 
@@ -421,9 +529,10 @@ def get_air():
 
     return get_json(url)
 
-# =========================================================
-# ВЛАЖНОСТЬ РАНЖИР
-# =========================================================
+
+# ---------------------------------------------------------
+# 1.4. РАНЖИРЫ И ПОЯСНЕНИЯ
+# ---------------------------------------------------------
 
 def humidity_description(humidity):
     if humidity < 10:
@@ -447,9 +556,6 @@ def humidity_description(humidity):
     else:
         return "почти насыщенный воздух — испарение минимально"
 
-# =========================================================
-# ДАВЛЕНИЕ РАНЖИР
-# =========================================================
 
 def pressure_description(pressure_hpa):
     if pressure_hpa < 980:
@@ -479,9 +585,6 @@ def pressure_description(pressure_hpa):
     else:
         return "экстремально высокое — необычная ситуация; при метеочуствительности и проблемах с АД соблюдать максимальную осторожность"
 
-# =========================================================
-# ВЕТЕР РАНЖИР
-# =========================================================
 
 def wind_description(speed):
     if speed < 1:
@@ -528,10 +631,6 @@ def gust_description(speed):
     else:
         return "экстремальные — высокая опасность разрушений и летящих предметов; оставайтесь в защищённом помещении"
 
-
-# =========================================================
-# УФ / ПЫЛЬ / ВЗВЕШЕННЫЕ ЧАСТИЦЫ / СОЛНЕЧНАЯ АКТИВНОСТЬ
-# =========================================================
 
 def uv_description(uv):
     if uv < 0.5:
@@ -608,10 +707,6 @@ def solar_activity_description(flux):
         return "экстремально высокая"
 
 
-# =========================================================
-# КОДЫ ЯВЛЕНИЙ
-# =========================================================
-
 def weather_phenomenon(code):
     phenomena = {
         0: "☀️ Ясно",
@@ -659,11 +754,12 @@ def weather_phenomenon(code):
         "⚠️ Неизвестное погодное явление"
     )
 
-# =========================================================
-# ТЕКСТ
-# =========================================================
 
-def make_text():
+# ---------------------------------------------------------
+# 1.5. ФОРМИРОВАНИЕ ПОГОДНОГО ПОСТА
+# ---------------------------------------------------------
+
+def make_weather_text():
 
     weather_data = get_weather()
     marine_data = get_marine()
@@ -936,73 +1032,518 @@ def make_text():
     return text
 
 
-# =========================================================
-# TELEGRAM
-# =========================================================
+# ---------------------------------------------------------
+# 1.6. ОБНОВЛЕНИЕ ПОГОДНОГО ПОСТА
+# ---------------------------------------------------------
 
-def send_message(text):
+def weather_slot(now=None):
+    if now is None:
+        now = datetime.now(TZ)
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
+    half = "00" if now.hour < 12 else "12"
+    return f"{now.strftime('%Y-%m-%d')}-{half}"
+
+
+def load_weather_slot():
+    if not os.path.exists(WEATHER_SLOT_FILE):
+        return None
+
+    try:
+        with open(
+            WEATHER_SLOT_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return file.read().strip() or None
+
+    except Exception:
+        return None
+
+
+def save_weather_slot(slot):
+    with open(
+        WEATHER_SLOT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        file.write(slot)
+
+
+def update_weather(force_new=False):
+    now = datetime.now(TZ)
+    text = make_weather_text()
+
+    current_slot = weather_slot(now)
+    saved_slot = load_weather_slot()
+    message_id = load_id_file(
+        WEATHER_MESSAGE_ID_FILE
     )
 
-    response = requests.post(
+    # Новый пост в каждом новом 12-часовом слоте.
+    # Благодаря WEATHER_SLOT_FILE это работает и после перезапуска.
+    need_new = (
+        force_new
+        or message_id is None
+        or saved_slot != current_slot
+    )
+
+    if need_new:
+        message_id = send_message(text)
+        save_id_file(
+            WEATHER_MESSAGE_ID_FILE,
+            message_id
+        )
+        save_weather_slot(current_slot)
+
+        print(
+            "ПОГОДА: создан новый пост:",
+            message_id,
+            now.strftime("%H:%M")
+        )
+    else:
+        edit_message(
+            message_id,
+            text
+        )
+
+        print(
+            "ПОГОДА: обновлено:",
+            now.strftime("%H:%M")
+        )
+
+    return message_id
+
+
+# =========================================================
+# 2. БЕН-ГУРИОН — ТАБЛО РЕЙСОВ
+# =========================================================
+# Независимый сервис.
+#
+# Источник:
+#   официальный государственный набор рейсов data.gov.il / IAA
+#
+# Публикация:
+#   1) прилёты
+#   2) вылеты
+#   3) изменения: задержки / отмены
+#
+# Обновление:
+#   один раз в 10 минут
+#
+# Принудительное обновление:
+#   /arrivals
+#   /departures
+#   /flights
+#   CMD: python weather_bot.py flights
+# =========================================================
+
+FLIGHTS_RESOURCE_ID = (
+    "e83f763b-b7d7-479e-b172-ae981ddc6de5"
+)
+
+FLIGHTS_UPDATE_INTERVAL = 600
+
+ARRIVALS_MESSAGE_ID_FILE = "arrivals_message_id.txt"
+DEPARTURES_MESSAGE_ID_FILE = "departures_message_id.txt"
+FLIGHT_ALERTS_MESSAGE_ID_FILE = "flight_alerts_message_id.txt"
+
+
+# ---------------------------------------------------------
+# 2.1. ПОЛУЧЕНИЕ ДАННЫХ
+# ---------------------------------------------------------
+
+def get_flights():
+    url = (
+        "https://data.gov.il/api/3/action/"
+        "datastore_search"
+    )
+
+    response = requests.get(
         url,
-        data={
-            "chat_id": CHANNEL,
-            "text": text,
+        params={
+            "resource_id": FLIGHTS_RESOURCE_ID,
+            "limit": 5000,
         },
         timeout=30,
     )
 
     response.raise_for_status()
+    data = response.json()
 
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    return result["result"]["message_id"]
-
-
-def edit_message(message_id, text):
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/editMessageText"
-    )
-
-    response = requests.post(
-        url,
-        data={
-            "chat_id": CHANNEL,
-            "message_id": message_id,
-            "text": text,
-        },
-        timeout=30,
-    )
-
-    result = response.json()
-
-    # Telegram возвращает ошибку, если текст
-    # полностью совпадает с предыдущим.
-    if not result.get("ok"):
-
-        description = result.get(
-            "description",
-            ""
+    if not data.get("success"):
+        raise RuntimeError(
+            "data.gov.il не вернул данные рейсов"
         )
 
-        if (
-            "message is not modified"
-            not in description.lower()
-        ):
-            raise RuntimeError(result)
+    return data["result"]["records"]
+
+
+# ---------------------------------------------------------
+# 2.2. НОРМАЛИЗАЦИЯ ПОЛЕЙ РЕЙСА
+# ---------------------------------------------------------
+
+def parse_flight_time(value):
+    if not value:
+        return None
+
+    try:
+        value = str(value).strip()
+
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=TZ)
+
+        return dt.astimezone(TZ)
+
+    except Exception:
+        return None
+
+
+def flight_number(flight):
+    return (
+        f"{flight.get('CHOPER', '')}"
+        f"{flight.get('CHFLTN', '')}"
+    ).strip()
+
+
+def flight_city(flight):
+    return (
+        flight.get("CHLOC1T")
+        or flight.get("CHLOC1D")
+        or flight.get("CHLOC1")
+        or "—"
+    ).strip()
+
+
+def flight_status(flight):
+    raw = (
+        flight.get("CHRMINE")
+        or ""
+    ).strip()
+
+    status = raw.upper()
+
+    translations = {
+        "LANDED": "🟢 приземлился",
+        "DEPARTED": "🟢 вылетел",
+        "ON TIME": "🟢 по расписанию",
+        "FINAL": "🟢 посадка заканчивается",
+        "BOARDING": "🟢 посадка",
+        "DELAYED": "🟡 задерживается",
+        "CANCELLED": "🔴 отменён",
+        "CANCELED": "🔴 отменён",
+    }
+
+    if status in translations:
+        return translations[status]
+
+    return raw if raw else "статус неизвестен"
+
+
+def flight_delay_minutes(flight):
+    scheduled = parse_flight_time(
+        flight.get("CHSTOL")
+    )
+
+    expected = parse_flight_time(
+        flight.get("CHPTOL")
+    )
+
+    if not scheduled or not expected:
+        return None
+
+    return int(
+        (expected - scheduled).total_seconds()
+        / 60
+    )
+
+
+def flight_delay_text(flight):
+    minutes = flight_delay_minutes(flight)
+
+    if minutes is None:
+        return ""
+
+    if minutes >= 10:
+        return f" +{minutes} мин"
+
+    if minutes <= -10:
+        return f" {minutes} мин"
+
+    return ""
+
+
+# ---------------------------------------------------------
+# 2.3. ОТБОР И ФОРМАТИРОВАНИЕ РЕЙСОВ
+# ---------------------------------------------------------
+
+def relevant_flights(
+    flights,
+    direction,
+    hours_back=1,
+    hours_forward=6
+):
+    now = datetime.now(TZ)
+
+    start = now - timedelta(
+        hours=hours_back
+    )
+
+    end = now + timedelta(
+        hours=hours_forward
+    )
+
+    result = []
+
+    for flight in flights:
+        if flight.get("CHAORD") != direction:
+            continue
+
+        t = (
+            parse_flight_time(
+                flight.get("CHPTOL")
+            )
+            or
+            parse_flight_time(
+                flight.get("CHSTOL")
+            )
+        )
+
+        if t is None:
+            continue
+
+        if start <= t <= end:
+            result.append((t, flight))
+
+    result.sort(
+        key=lambda item: item[0]
+    )
+
+    return result
+
+
+def make_flight_line(t, flight):
+    number = flight_number(flight)
+    city = flight_city(flight)
+    terminal = flight.get("CHTERM")
+    status = flight_status(flight)
+    delay = flight_delay_text(flight)
+
+    line = (
+        f"{t.strftime('%H:%M')}  "
+        f"{number}  "
+        f"{city}"
+    )
+
+    if terminal:
+        line += f"  T{terminal}"
+
+    line += f"\n   {status}{delay}"
+
+    return line
+
+
+# ---------------------------------------------------------
+# 2.4. ТЕКСТ: ПРИЛЁТЫ / ВЫЛЕТЫ / ИЗМЕНЕНИЯ
+# ---------------------------------------------------------
+
+def make_flights_text(
+    flights,
+    direction
+):
+    if direction == "A":
+        title = "🛬 БЕН-ГУРИОН — ПРИЛЁТЫ"
+    else:
+        title = "✈️ БЕН-ГУРИОН — ВЫЛЕТЫ"
+
+    selected = relevant_flights(
+        flights,
+        direction
+    )[:25]
+
+    lines = [
+        title,
+        "",
+    ]
+
+    if not selected:
+        lines.append(
+            "Нет рейсов в выбранном интервале."
+        )
+    else:
+        for t, flight in selected:
+            lines.append(
+                make_flight_line(
+                    t,
+                    flight
+                )
+            )
+
+    now = datetime.now(TZ)
+
+    lines.extend([
+        "",
+        f"🕒 Обновлено: {now.strftime('%H:%M')}",
+        "",
+        "@ne_zaika",
+    ])
+
+    return "\n".join(lines)
+
+
+def make_flight_alerts_text(flights):
+    now = datetime.now(TZ)
+
+    start = now - timedelta(hours=1)
+    end = now + timedelta(hours=8)
+
+    alerts = []
+
+    for flight in flights:
+        t = (
+            parse_flight_time(
+                flight.get("CHPTOL")
+            )
+            or
+            parse_flight_time(
+                flight.get("CHSTOL")
+            )
+        )
+
+        if t is None:
+            continue
+
+        if not (start <= t <= end):
+            continue
+
+        delay = (
+            flight_delay_minutes(flight)
+            or 0
+        )
+
+        status = (
+            flight.get("CHRMINE")
+            or ""
+        ).upper()
+
+        problem = (
+            delay >= 20
+            or "DELAY" in status
+            or "CANCEL" in status
+        )
+
+        if problem:
+            alerts.append((t, flight))
+
+    alerts.sort(
+        key=lambda item: item[0]
+    )
+
+    lines = [
+        "⚠️ БЕН-ГУРИОН — ИЗМЕНЕНИЯ",
+        "",
+    ]
+
+    if not alerts:
+        lines.append(
+            "Существенных задержек и отмен нет."
+        )
+    else:
+        for t, flight in alerts[:25]:
+            direction = (
+                "🛬"
+                if flight.get("CHAORD") == "A"
+                else "✈️"
+            )
+
+            lines.append(
+                direction + " " +
+                make_flight_line(
+                    t,
+                    flight
+                )
+            )
+
+    lines.extend([
+        "",
+        f"🕒 Обновлено: {now.strftime('%H:%M')}",
+        "",
+        "@ne_zaika",
+    ])
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------
+# 2.5. ОБНОВЛЕНИЕ ТРЁХ ПОСТОВ БЕН-ГУРИОНА
+# ---------------------------------------------------------
+
+def update_flight_board():
+    print("БЕН-ГУРИОН: получаю табло...")
+
+    flights = get_flights()
+
+    arrivals_text = make_flights_text(
+        flights,
+        "A"
+    )
+
+    departures_text = make_flights_text(
+        flights,
+        "D"
+    )
+
+    alerts_text = make_flight_alerts_text(
+        flights
+    )
+
+    update_persistent_post(
+        arrivals_text,
+        ARRIVALS_MESSAGE_ID_FILE
+    )
+
+    update_persistent_post(
+        departures_text,
+        DEPARTURES_MESSAGE_ID_FILE
+    )
+
+    update_persistent_post(
+        alerts_text,
+        FLIGHT_ALERTS_MESSAGE_ID_FILE
+    )
+
+    print(
+        "БЕН-ГУРИОН: обновлено:",
+        datetime.now(TZ).strftime("%H:%M")
+    )
+
 
 # =========================================================
-# ПУШ через ТГ
+# 3. TELEGRAM-КОМАНДЫ
 # =========================================================
+# Здесь только маршрутизация команд.
+# Логика погоды и аэропорта остаётся внутри своих блоков.
+# =========================================================
+
+def send_private_reply(chat_id, text):
+    response = requests.post(
+        (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/sendMessage"
+        ),
+        data={
+            "chat_id": chat_id,
+            "text": text,
+        },
+        timeout=10
+    )
+
+    response.raise_for_status()
+
 
 def check_telegram_commands(offset=None):
     url = (
@@ -1012,7 +1553,7 @@ def check_telegram_commands(offset=None):
 
     params = {
         "timeout": 0,
-        "limit": 10
+        "limit": 20
     }
 
     if offset is not None:
@@ -1031,225 +1572,223 @@ def check_telegram_commands(offset=None):
         return offset
 
     for update in data.get("result", []):
-        update_id = update["update_id"]
-        offset = update_id + 1
+        offset = update["update_id"] + 1
 
         message = update.get("message")
 
         if not message:
             continue
 
-        text = message.get(
-            "text",
-            ""
-        ).strip().lower()
+        command = (
+            message.get("text", "")
+            .strip()
+            .lower()
+            .split()[0]
+            if message.get("text")
+            else ""
+        )
 
-        if text == "/weather":
-            message_id = load_message_id()
-            weather_text = make_text()
+        chat_id = message["chat"]["id"]
 
-            if message_id is None:
-                message_id = send_message(
-                    weather_text
-                )
-                save_message_id(
-                    message_id
-                )
-            else:
-                edit_message(
-                    message_id,
-                    weather_text
+        try:
+            if command == "/weather":
+                update_weather()
+                send_private_reply(
+                    chat_id,
+                    "Погода обновлена."
                 )
 
-            chat_id = message["chat"]["id"]
+            elif command == "/arrivals":
+                flights = get_flights()
+                update_persistent_post(
+                    make_flights_text(
+                        flights,
+                        "A"
+                    ),
+                    ARRIVALS_MESSAGE_ID_FILE
+                )
+                send_private_reply(
+                    chat_id,
+                    "Табло прилётов обновлено."
+                )
 
-            requests.post(
-                f"https://api.telegram.org/"
-                f"bot{BOT_TOKEN}/sendMessage",
-                data={
-                    "chat_id": chat_id,
-                    "text": "Погода обновлена."
-                },
-                timeout=10
+            elif command == "/departures":
+                flights = get_flights()
+                update_persistent_post(
+                    make_flights_text(
+                        flights,
+                        "D"
+                    ),
+                    DEPARTURES_MESSAGE_ID_FILE
+                )
+                send_private_reply(
+                    chat_id,
+                    "Табло вылетов обновлено."
+                )
+
+            elif command == "/flights":
+                update_flight_board()
+                send_private_reply(
+                    chat_id,
+                    "Табло Бен-Гуриона обновлено."
+                )
+
+        except Exception as error:
+            print(
+                "ОШИБКА TELEGRAM-КОМАНДЫ:",
+                command,
+                error
             )
+
+            try:
+                send_private_reply(
+                    chat_id,
+                    f"Ошибка выполнения {command}"
+                )
+            except Exception:
+                pass
 
     return offset
 
-# =========================================================
-# MESSAGE ID
-# =========================================================
-
-def load_message_id():
-
-    if not os.path.exists(
-        MESSAGE_ID_FILE
-    ):
-        return None
-
-    try:
-
-        with open(
-            MESSAGE_ID_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return int(
-                file.read().strip()
-            )
-
-    except Exception:
-        return None
-
-
-def save_message_id(message_id):
-
-    with open(
-        MESSAGE_ID_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(
-            str(message_id)
-        )
 
 # =========================================================
-# ОСНОВНОЙ ЦИКЛ — АВТООБНОВЛЕНИЕ КАЖДЫЙ РОВНЫЙ ЧАС
+# 4. ПЛАНИРОВЩИК
+# =========================================================
+# Оба сервиса независимы.
+#
+# Погода:
+#   проверяется раз в минуту;
+#   автоматически обновляется при смене часа.
+#
+# Бен-Гурион:
+#   обновляется независимо каждые 10 минут.
+#
+# Ошибка одного сервиса НЕ останавливает второй.
 # =========================================================
 
 def main():
-
-    message_id = load_message_id()
     telegram_offset = None
 
-    # При запуске сразу обновляем текущий пост
+    # ----- ПОГОДА: старт -----
     try:
-        text = make_text()
-        now = datetime.now(TZ)
-
-        if message_id is None:
-            message_id = send_message(text)
-            save_message_id(message_id)
-            print(
-                "Создан погодный пост:",
-                message_id
-            )
-        else:
-            edit_message(
-                message_id,
-                text
-            )
-            print(
-                "Погодный пост обновлён при запуске:",
-                now.strftime("%H:%M")
-            )
-
+        update_weather()
     except Exception as error:
         print(
-            "ОШИБКА ПРИ ЗАПУСКЕ:",
+            "ПОГОДА — ОШИБКА ПРИ ЗАПУСКЕ:",
             error
         )
 
-    # Запоминаем, какой час уже обработан
-    last_auto_hour = datetime.now(TZ).strftime(
-        "%Y-%m-%d %H"
+    # ----- БЕН-ГУРИОН: старт -----
+    try:
+        update_flight_board()
+        last_flights_update = time.time()
+    except Exception as error:
+        print(
+            "БЕН-ГУРИОН — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+        last_flights_update = 0
+
+    last_weather_hour = (
+        datetime.now(TZ).strftime(
+            "%Y-%m-%d %H"
+        )
     )
 
     print(
-        "Следующее автоматическое обновление после смены часа."
+        "ДИСПЕТЧЕР ЗАПУЩЕН:",
+        "погода — каждый час;",
+        "Бен-Гурион — каждые 10 минут."
     )
 
     while True:
 
+        # ---------------------------------------------
+        # TELEGRAM-КОМАНДЫ
+        # ---------------------------------------------
         try:
-            # Команда /weather из Telegram
-            telegram_offset = check_telegram_commands(
-                telegram_offset
+            telegram_offset = (
+                check_telegram_commands(
+                    telegram_offset
+                )
             )
-
-            now = datetime.now(TZ)
-            current_hour = now.strftime(
-                "%Y-%m-%d %H"
-            )
-
-            # Час сменился — выполняем автоматическое обновление.
-            # Даже если компьютер/сеть задержали цикл на минуту-другую,
-            # обновление не будет пропущено.
-            if current_hour != last_auto_hour:
-
-                text = make_text()
-
-                # В 00 часов создаём НОВЫЙ суточный пост
-                if now.hour == 0:
-                    message_id = send_message(
-                        text
-                    )
-                    save_message_id(
-                        message_id
-                    )
-
-                    print(
-                        "Создан новый суточный погодный пост:",
-                        message_id,
-                        now.strftime("%H:%M")
-                    )
-
-                else:
-                    if message_id is None:
-                        message_id = load_message_id()
-
-                    if message_id is None:
-                        message_id = send_message(
-                            text
-                        )
-                        save_message_id(
-                            message_id
-                        )
-
-                        print(
-                            "Создан погодный пост:",
-                            message_id
-                        )
-                    else:
-                        edit_message(
-                            message_id,
-                            text
-                        )
-
-                        print(
-                            "Автоматическое обновление:",
-                            now.strftime("%H:%M")
-                        )
-
-                last_auto_hour = current_hour
-
         except Exception as error:
             print(
-                "ОШИБКА АВТООБНОВЛЕНИЯ:",
+                "TELEGRAM — ОШИБКА:",
                 error
             )
 
-        # Проверяем время и Telegram-команды каждые 1 минуту
-        time.sleep(60)
+        now = datetime.now(TZ)
+
+        # ---------------------------------------------
+        # ПОГОДА — НЕЗАВИСИМЫЙ ТАЙМЕР
+        # ---------------------------------------------
+        current_weather_hour = (
+            now.strftime("%Y-%m-%d %H")
+        )
+
+        if (
+            current_weather_hour
+            != last_weather_hour
+        ):
+            try:
+                update_weather()
+
+                last_weather_hour = (
+                    current_weather_hour
+                )
+
+            except Exception as error:
+                print(
+                    "ПОГОДА — ОШИБКА "
+                    "АВТООБНОВЛЕНИЯ:",
+                    error
+                )
+
+        # ---------------------------------------------
+        # БЕН-ГУРИОН — НЕЗАВИСИМЫЙ ТАЙМЕР
+        # ---------------------------------------------
+        if (
+            time.time() - last_flights_update
+            >= FLIGHTS_UPDATE_INTERVAL
+        ):
+            try:
+                update_flight_board()
+
+                last_flights_update = (
+                    time.time()
+                )
+
+            except Exception as error:
+                print(
+                    "БЕН-ГУРИОН — ОШИБКА "
+                    "АВТООБНОВЛЕНИЯ:",
+                    error
+                )
+
+        # ---------------------------------------------
+        # ОБЩИЙ ТИК ДИСПЕТЧЕРА
+        # ---------------------------------------------
+        time.sleep(SCHEDULER_INTERVAL)
 
 
 # =========================================================
-# ПУШ через cmd
+# 5. ЗАПУСК И ПРИНУДИТЕЛЬНЫЕ КОМАНДЫ ИЗ CMD
 # =========================================================
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "now":
-        message_id = load_message_id()
-        text = make_text()
 
-        if message_id is None:
-            message_id = send_message(text)
-            save_message_id(message_id)
-            print("Создан новый погодный пост:", message_id)
-        else:
-            edit_message(message_id, text)
-            print("Погодный пост принудительно обновлён.")
+    if (
+        len(sys.argv) > 1
+        and sys.argv[1].lower() == "now"
+    ):
+        update_weather()
+
+    elif (
+        len(sys.argv) > 1
+        and sys.argv[1].lower() == "flights"
+    ):
+        update_flight_board()
 
     else:
         main()
