@@ -1,6 +1,9 @@
 # =========================================================
-# Блочная структура: погода + Бен Гурион
-# | 2.0.0
+# Погода теперь ждёт конкретный следующий ровный час через next_weather_update. Если цикл проснулся в 05:01, обновление всё равно выполнится и следующий срок будет 06:00, а не 06:01.
+Переносы рейсов теперь показываются нормально:
++35 мин, +1 ч 20 мин, +2 ч.
+В строку рейса добавлена авиакомпания через CHOPERD.
+# | 2.0.1
 # =========================================================
 
 
@@ -1210,6 +1213,30 @@ def flight_number(flight):
     ).strip()
 
 
+
+def flight_airline(flight):
+    return (
+        flight.get("CHOPERD")
+        or flight.get("CHOPER")
+        or "—"
+    ).strip()
+
+
+def format_flight_delay(minutes):
+    sign = "-" if minutes < 0 else "+"
+    value = abs(minutes)
+
+    if value < 60:
+        return f"{sign}{value} мин"
+
+    hours = value // 60
+    mins = value % 60
+
+    if mins == 0:
+        return f"{sign}{hours} ч"
+
+    return f"{sign}{hours} ч {mins:02d} мин"
+
 def flight_city(flight):
     return (
         flight.get("CHLOC1T")
@@ -1268,11 +1295,10 @@ def flight_delay_text(flight):
     if minutes is None:
         return ""
 
-    if minutes >= 10:
-        return f" +{minutes} мин"
-
-    if minutes <= -10:
-        return f" {minutes} мин"
+    if minutes >= 10 or minutes <= -10:
+        return " " + format_flight_delay(
+            minutes
+        )
 
     return ""
 
@@ -1328,6 +1354,7 @@ def relevant_flights(
 
 def make_flight_line(t, flight):
     number = flight_number(flight)
+    airline = flight_airline(flight)
     city = flight_city(flight)
     terminal = flight.get("CHTERM")
     status = flight_status(flight)
@@ -1336,6 +1363,7 @@ def make_flight_line(t, flight):
     line = (
         f"{t.strftime('%H:%M')}  "
         f"{number}  "
+        f"{airline}\n"
         f"{city}"
     )
 
@@ -1666,6 +1694,17 @@ def check_telegram_commands(offset=None):
 # Ошибка одного сервиса НЕ останавливает второй.
 # =========================================================
 
+def next_full_hour(now):
+    return (
+        now.replace(
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+        + timedelta(hours=1)
+    )
+
+
 def main():
     telegram_offset = None
 
@@ -1678,6 +1717,11 @@ def main():
             error
         )
 
+    # Следующее гарантированное часовое обновление.
+    next_weather_update = next_full_hour(
+        datetime.now(TZ)
+    )
+
     # ----- БЕН-ГУРИОН: старт -----
     try:
         update_flight_board()
@@ -1688,12 +1732,6 @@ def main():
             error
         )
         last_flights_update = 0
-
-    last_weather_hour = (
-        datetime.now(TZ).strftime(
-            "%Y-%m-%d %H"
-        )
-    )
 
     print(
         "ДИСПЕТЧЕР ЗАПУЩЕН:",
@@ -1723,19 +1761,13 @@ def main():
         # ---------------------------------------------
         # ПОГОДА — НЕЗАВИСИМЫЙ ТАЙМЕР
         # ---------------------------------------------
-        current_weather_hour = (
-            now.strftime("%Y-%m-%d %H")
-        )
-
-        if (
-            current_weather_hour
-            != last_weather_hour
-        ):
+        if now >= next_weather_update:
             try:
                 update_weather()
 
-                last_weather_hour = (
-                    current_weather_hour
+                print(
+                    "ПОГОДА — АВТООБНОВЛЕНИЕ:",
+                    now.strftime("%H:%M")
                 )
 
             except Exception as error:
@@ -1744,6 +1776,14 @@ def main():
                     "АВТООБНОВЛЕНИЯ:",
                     error
                 )
+
+            # ВАЖНО:
+            # даже если обновление произошло с задержкой,
+            # назначаем следующий РОВНЫЙ час,
+            # а не "+1 час от текущего времени".
+            next_weather_update = next_full_hour(
+                datetime.now(TZ)
+            )
 
         # ---------------------------------------------
         # БЕН-ГУРИОН — НЕЗАВИСИМЫЙ ТАЙМЕР
