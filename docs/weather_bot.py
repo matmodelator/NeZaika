@@ -1,9 +1,7 @@
 # =========================================================
-# Фикс БотОбновления
-# | 2.0.4
+# ВАЛЮТА автообновление
+# | 2.1.1
 # =========================================================
-
-
 
 
 import os
@@ -1555,6 +1553,338 @@ def update_flight_board():
     )
 
 
+
+# =========================================================
+# ВАЛЮТЫ
+# =========================================================
+
+RATES_MESSAGE_ID_FILE = state_file("rates_message_id.txt")
+
+CURRENCY_SPECS = [
+    ("USD", "🇺🇸", "Доллар", "долларов", 1),
+    ("EUR", "🇪🇺", "Евро", "евро", 1),
+    ("GBP", "🇬🇧", "Фунт", "фунтов", 1),
+    ("CHF", "🇨🇭", "Франк", "франков", 1),
+    ("CNY", "🇨🇳", "Юань", "юаней", 1),
+
+    ("RUB", "🇷🇺", "Рубль", "рублей", 100),
+    ("UAH", "🇺🇦", "Гривна", "гривен", 100),
+    ("BYN", "🇧🇾", "Белорусский рубль", "рублей", 1),
+    ("MDL", "🇲🇩", "Лей", "леев", 100),
+    ("GEL", "🇬🇪", "Лари", "лари", 1),
+    ("AMD", "🇦🇲", "Драм", "драмов", 1000),
+    ("AZN", "🇦🇿", "Манат", "манатов", 1),
+    ("KZT", "🇰🇿", "Тенге", "тенге", 1000),
+    ("UZS", "🇺🇿", "Сум", "сумов", 10000),
+    ("KGS", "🇰🇬", "Сом", "сомов", 100),
+
+    ("JOD", "🇯🇴", "Динар", "динаров", 1),
+    ("EGP", "🇪🇬", "Египетский фунт", "фунтов", 100),
+]
+
+CURRENCY_GROUPS = [
+    ("ОСНОВНЫЕ", ["USD", "EUR", "GBP", "CHF", "CNY"]),
+    ("БЫВШИЙ СССР", [
+        "RUB", "UAH", "BYN", "MDL", "GEL",
+        "AMD", "AZN", "KZT", "UZS", "KGS"
+    ]),
+    ("СОСЕДИ", ["JOD", "EGP"]),
+]
+
+
+def get_boi_rates():
+    response = requests.get(
+        "https://www.boi.org.il/PublicApi/GetExchangeRates",
+        timeout=30
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    result = {}
+
+    for item in data.get("exchangeRates", []):
+        code = str(item.get("key", "")).upper().strip()
+        value = item.get("currentExchangeRate")
+
+        if not code or value is None:
+            continue
+
+        # API Банка Израиля возвращает представительский курс.
+        # Для текущего списка используем опубликованное значение
+        # как ILS за единицу валюты.
+        result[code] = {
+            "ils_per_unit": float(value),
+            "source": "Банк Израиля",
+            "last_update": item.get("lastUpdate"),
+        }
+
+    return result
+
+
+def get_frankfurter_rates():
+    response = requests.get(
+        "https://api.frankfurter.dev/v2/rates",
+        params={"base": "ILS"},
+        timeout=30
+    )
+    response.raise_for_status()
+
+    result = {}
+
+    for item in response.json():
+        code = str(item.get("quote", "")).upper().strip()
+        value = item.get("rate")
+
+        if not code or value is None:
+            continue
+
+        value = float(value)
+
+        if value > 0:
+            result[code] = {
+                "ils_per_unit": 1 / value,
+                "source": "Frankfurter",
+                "last_update": item.get("date"),
+            }
+
+    return result
+
+
+def get_crypto_rates():
+    response = requests.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={
+            "ids": "bitcoin,ethereum,tether",
+            "vs_currencies": "ils",
+            "include_24hr_change": "true",
+            "include_last_updated_at": "true",
+        },
+        headers={
+            "accept": "application/json",
+            "User-Agent": "ne-zaika-bot/1.0",
+        },
+        timeout=30
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    mapping = {
+        "bitcoin": ("BTC", "₿", "Bitcoin"),
+        "ethereum": ("ETH", "Ξ", "Ethereum"),
+        "tether": ("USDT", "₮", "Tether"),
+    }
+
+    result = {}
+
+    for api_id, (code, symbol, name) in mapping.items():
+        item = data.get(api_id, {})
+        price = item.get("ils")
+
+        if price is None:
+            continue
+
+        result[code] = {
+            "symbol": symbol,
+            "name": name,
+            "price": float(price),
+            "change": item.get("ils_24h_change"),
+        }
+
+    return result
+
+
+def get_currency_rates():
+    rates = {}
+
+    try:
+        rates.update(get_boi_rates())
+    except Exception as error:
+        print("ВАЛЮТЫ — БАНК ИЗРАИЛЯ:", error)
+
+    try:
+        extra = get_frankfurter_rates()
+
+        for code, item in extra.items():
+            if code not in rates:
+                rates[code] = item
+
+    except Exception as error:
+        print("ВАЛЮТЫ — FRANKFURTER:", error)
+
+    return rates
+
+
+def format_rate_number(value, decimals=2):
+    return f"{value:,.{decimals}f}".replace(",", " ")
+
+
+def make_currency_pair(spec, info):
+    code, flag, name, plural, units = spec
+    rate = info["ils_per_unit"]
+
+    direct = rate * units
+    reverse = 1000 / rate
+
+    if direct >= 100:
+        direct_decimals = 0
+    elif direct >= 1:
+        direct_decimals = 2
+    else:
+        direct_decimals = 3
+
+    if reverse >= 10000:
+        reverse_decimals = 0
+    elif reverse >= 1000:
+        reverse_decimals = 1
+    else:
+        reverse_decimals = 2
+
+    if units == 1:
+        first = f"за 1 {name.lower()}"
+    else:
+        first = f"за {units} {plural}"
+
+    return (
+        f"{flag} {name} — шекель\n"
+        f"{first} — "
+        f"{format_rate_number(direct, direct_decimals)} ₪\n"
+        f"за 1000 ₪ — "
+        f"{format_rate_number(reverse, reverse_decimals)} {code}"
+    )
+
+
+def make_crypto_pair(code, item):
+    price = item["price"]
+    reverse = 1000 / price
+
+    if price >= 1000:
+        price_decimals = 0
+    elif price >= 1:
+        price_decimals = 2
+    else:
+        price_decimals = 4
+
+    lines = [
+        f"{item['symbol']} {item['name']} — шекель",
+        (
+            f"за 1 {code} — "
+            f"{format_rate_number(price, price_decimals)} ₪"
+        ),
+        (
+            "за 1000 ₪ — "
+            f"{reverse:.6f} {code}"
+        ),
+    ]
+
+    change = item.get("change")
+
+    if change is not None:
+        change = float(change)
+
+        arrow = (
+            "▲"
+            if change > 0
+            else "▼"
+            if change < 0
+            else "→"
+        )
+
+        lines.append(
+            f"за 24 часа — {arrow} {abs(change):.2f}%"
+        )
+
+    return "\n".join(lines)
+
+
+def make_rates_text():
+    rates = get_currency_rates()
+    specs = {spec[0]: spec for spec in CURRENCY_SPECS}
+
+    lines = ["💱 КУРСЫ ВАЛЮТ", ""]
+
+    for title, codes in CURRENCY_GROUPS:
+        lines.extend([title, ""])
+
+        for code in codes:
+            info = rates.get(code)
+
+            if info is None:
+                spec = specs[code]
+                lines.extend([
+                    f"{spec[1]} {spec[2]} — шекель",
+                    "данных нет",
+                    "",
+                ])
+            else:
+                lines.extend([
+                    make_currency_pair(specs[code], info),
+                    "",
+                ])
+
+    lines.extend(["КРИПТОВАЛЮТА", ""])
+
+    try:
+        crypto = get_crypto_rates()
+
+        for code in ("BTC", "ETH", "USDT"):
+            item = crypto.get(code)
+
+            if item is None:
+                lines.extend([
+                    f"{code} — шекель",
+                    "данных нет",
+                    "",
+                ])
+                continue
+
+            lines.extend([
+                make_crypto_pair(code, item),
+                "",
+            ])
+
+    except Exception as error:
+        print("ВАЛЮТЫ — КРИПТО:", error)
+
+        lines.extend([
+            "₿ Bitcoin — шекель",
+            "данных нет",
+            "",
+            "Ξ Ethereum — шекель",
+            "данных нет",
+            "",
+            "₮ Tether — шекель",
+            "данных нет",
+        ])
+
+    now = datetime.now(TZ)
+
+    lines.extend([
+        "",
+        f"🕒 Обновлено: {now.strftime('%H:%M:%S')}",
+        "",
+        "@ne_zaika",
+    ])
+
+    return "\n".join(lines)
+
+
+def update_rates():
+    message_id = update_persistent_post(
+        make_rates_text(),
+        RATES_MESSAGE_ID_FILE
+    )
+
+    print(
+        "ВАЛЮТЫ: обновлено:",
+        datetime.now(TZ).strftime("%H:%M:%S"),
+        "message_id:",
+        message_id
+    )
+
+    return message_id
+
+
 # =========================================================
 # 3. TELEGRAM-КОМАНДЫ
 # =========================================================
@@ -1671,6 +2001,17 @@ def check_telegram_commands(offset=None):
                     "Табло Бен-Гуриона обновлено."
                 )
 
+            elif command == "/rates":
+                rates_message_id = update_rates()
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Курсы обновлены. "
+                        f"Пост #{rates_message_id}. "
+                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
+                    )
+                )
+
         except Exception as error:
             print(
                 "ОШИБКА TELEGRAM-КОМАНДЫ:",
@@ -1717,6 +2058,13 @@ def flights_schedule_key(now):
     )
 
 
+def rates_schedule_key(now):
+    if now.hour in (8, 12, 16, 20):
+        return now.strftime("%Y-%m-%d %H")
+
+    return None
+
+
 def main():
     telegram_offset = None
 
@@ -1758,17 +2106,33 @@ def main():
             error
         )
 
+    try:
+        update_rates()
+        print(
+            "ВАЛЮТЫ — ОБНОВЛЕНЫ ПРИ ЗАПУСКЕ:",
+            datetime.now(TZ).strftime("%H:%M:%S")
+        )
+    except Exception as error:
+        print(
+            "ВАЛЮТЫ — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
     now = datetime.now(TZ)
 
     # Текущие интервалы считаем обработанными ИМЕННО ПОСЛЕ
     # стартового обновления.
     last_weather_key = weather_schedule_key(now)
     last_flights_key = flights_schedule_key(now)
+    last_rates_key = None
 
     print("ДИСПЕТЧЕР ЗАПУЩЕН.")
     print("Погода: при смене часа.")
     print(
         "Бен-Гурион: в 00, 10, 20, 30, 40 и 50 минут."
+    )
+    print(
+        "Валюты: в 08:00, 12:00, 16:00 и 20:00."
     )
 
     while True:
@@ -1822,6 +2186,25 @@ def main():
                 )
 
         # ---------------------------------------------
+        # ВАЛЮТЫ — 08:00 / 12:00 / 16:00 / 20:00
+        # ---------------------------------------------
+        current_rates_key = rates_schedule_key(now)
+
+        if (
+            current_rates_key is not None
+            and current_rates_key != last_rates_key
+        ):
+            try:
+                update_rates()
+                last_rates_key = current_rates_key
+
+            except Exception as error:
+                print(
+                    "ВАЛЮТЫ — ОШИБКА АВТООБНОВЛЕНИЯ:",
+                    error
+                )
+
+        # ---------------------------------------------
         # TELEGRAM-КОМАНДЫ
         # ---------------------------------------------
         try:
@@ -1858,6 +2241,12 @@ if __name__ == "__main__":
         and sys.argv[1].lower() == "flights"
     ):
         update_flight_board()
+
+    elif (
+        len(sys.argv) > 1
+        and sys.argv[1].lower() == "rates"
+    ):
+        update_rates()
 
     else:
         main()
