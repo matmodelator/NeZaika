@@ -1,7 +1,10 @@
 # =========================================================
-# ВАЛЮТА страны
-# | 2.1.2
+# Каждое обновление → новый пост.МИРОВОЕ ВРЕМЯ — без UTC.Светофор. Для DELAYED задержка CHPTOL - CHSTOL. При запуске консоль показывает версию
+# | 2.3.0
 # =========================================================
+
+
+
 
 
 import os
@@ -1074,48 +1077,20 @@ def save_weather_slot(slot):
 
 
 def update_weather(force_new=False):
+    # НИКАКОГО редактирования:
+    # каждое обновление погоды — новый пост.
     now = datetime.now(TZ)
     text = make_weather_text()
 
-    current_slot = weather_slot(now)
-    saved_slot = load_weather_slot()
-    message_id = load_id_file(
-        WEATHER_MESSAGE_ID_FILE
+    message_id = send_message(
+        text
     )
 
-    # Новый пост в каждом новом 12-часовом слоте.
-    # Благодаря WEATHER_SLOT_FILE это работает и после перезапуска.
-    need_new = (
-        force_new
-        or message_id is None
-        or saved_slot != current_slot
+    print(
+        "ПОГОДА: создан новый пост:",
+        message_id,
+        now.strftime("%H:%M:%S")
     )
-
-    if need_new:
-        message_id = send_message(text)
-        save_id_file(
-            WEATHER_MESSAGE_ID_FILE,
-            message_id
-        )
-        save_weather_slot(current_slot)
-
-        print(
-            "ПОГОДА: создан новый пост:",
-            message_id,
-            now.strftime("%H:%M")
-        )
-    else:
-        message_id = edit_message(
-            message_id,
-            text
-        )
-
-        print(
-            "ПОГОДА: обновлено:",
-            now.strftime("%H:%M:%S"),
-            "message_id:",
-            message_id
-        )
 
     return message_id
 
@@ -1149,8 +1124,10 @@ FLIGHTS_RESOURCE_ID = (
 
 FLIGHTS_UPDATE_INTERVAL = 600
 
-ARRIVALS_MESSAGE_ID_FILE = state_file("arrivals_message_id.txt")
-DEPARTURES_MESSAGE_ID_FILE = state_file("departures_message_id.txt")
+ARRIVALS_ACTUAL_MESSAGE_ID_FILE = state_file("arrivals_actual_message_id.txt")
+ARRIVALS_NEXT_MESSAGE_ID_FILE = state_file("arrivals_next_message_id.txt")
+DEPARTURES_ACTUAL_MESSAGE_ID_FILE = state_file("departures_actual_message_id.txt")
+DEPARTURES_NEXT_MESSAGE_ID_FILE = state_file("departures_next_message_id.txt")
 FLIGHT_ALERTS_MESSAGE_ID_FILE = state_file("flight_alerts_message_id.txt")
 
 
@@ -1225,20 +1202,6 @@ def flight_airline(flight):
     ).strip()
 
 
-def format_flight_delay(minutes):
-    sign = "-" if minutes < 0 else "+"
-    value = abs(minutes)
-
-    if value < 60:
-        return f"{sign}{value} мин"
-
-    hours = value // 60
-    mins = value % 60
-
-    if mins == 0:
-        return f"{sign}{hours} ч"
-
-    return f"{sign}{hours} ч {mins:02d} мин"
 
 def flight_city(flight):
     return (
@@ -1248,33 +1211,47 @@ def flight_city(flight):
         or "—"
     ).strip()
 
-
-def flight_status(flight):
-    raw = (
-        flight.get("CHRMINE")
-        or ""
+def flight_status_raw(flight):
+    return str(
+        flight.get("CHRMINE") or ""
     ).strip()
 
-    status = raw.upper()
 
-    translations = {
-        "LANDED": "🟢 приземлился",
-        "DEPARTED": "🟢 вылетел",
-        "ON TIME": "🟢 по расписанию",
-        "FINAL": "🟢 посадка заканчивается",
-        "BOARDING": "🟢 посадка",
-        "DELAYED": "🟡 задерживается",
-        "CANCELLED": "🔴 отменён",
-        "CANCELED": "🔴 отменён",
-    }
+def flight_status_light(flight):
+    """
+    Цвет определяется ТОЛЬКО по CHRMINE из IAA.
+    Сам текст статуса не переводится.
+    """
+    status = flight_status_raw(flight).upper()
 
-    if status in translations:
-        return translations[status]
+    if status == "LANDED":
+        return "🔵"
 
-    return raw if raw else "статус неизвестен"
+    if status == "DEPARTED":
+        return "⚪"
+
+    if (
+        "CANCELLED" in status
+        or "CANCELED" in status
+    ):
+        return "🔴"
+
+    if "DELAY" in status:
+        return "🟡"
+
+    return "🟢"
 
 
-def flight_delay_minutes(flight):
+def delayed_minutes(flight):
+    """
+    Время задержки считаем ТОЛЬКО если CHRMINE = DELAYED
+    (или содержит DELAY).
+    """
+    status = flight_status_raw(flight).upper()
+
+    if "DELAY" not in status:
+        return None
+
     scheduled = parse_flight_time(
         flight.get("CHSTOL")
     )
@@ -1286,42 +1263,200 @@ def flight_delay_minutes(flight):
     if not scheduled or not expected:
         return None
 
-    return int(
+    minutes = int(
         (expected - scheduled).total_seconds()
         / 60
     )
 
+    if minutes <= 0:
+        return None
 
-def flight_delay_text(flight):
-    minutes = flight_delay_minutes(flight)
+    return minutes
 
-    if minutes is None:
-        return ""
 
-    if minutes >= 10 or minutes <= -10:
-        return " " + format_flight_delay(
-            minutes
-        )
+def format_delay(minutes):
+    if minutes < 60:
+        return f"+{minutes} мин"
 
-    return ""
+    hours = minutes // 60
+    mins = minutes % 60
+
+    if mins == 0:
+        return f"+{hours} ч"
+
+    return f"+{hours} ч {mins:02d} мин"
+
+
+
+
+
 
 
 # ---------------------------------------------------------
 # 2.3. ОТБОР И ФОРМАТИРОВАНИЕ РЕЙСОВ
 # ---------------------------------------------------------
 
-def relevant_flights(
-    flights,
-    direction,
-    hours_back=1,
-    hours_forward=6
-):
-    now = datetime.now(TZ)
+def flight_physical_key(flight):
+    """
+    Ключ физического рейса для склейки code-share.
 
-    start = now - timedelta(
-        hours=hours_back
+    Номер рейса и авиакомпания НЕ входят в ключ.
+    Склеиваем только если одновременно совпадают:
+    направление, аэропорт, плановое время,
+    расчётное/фактическое время и терминал.
+    """
+    return (
+        str(flight.get("CHAORD") or "").strip(),
+        str(flight.get("CHLOC1") or "").strip(),
+        str(flight.get("CHSTOL") or "").strip(),
+        str(flight.get("CHPTOL") or "").strip(),
+        str(flight.get("CHTERM") or "").strip(),
     )
 
+
+def merge_duplicate_flights(items):
+    """
+    Дубли не удаляем бесследно:
+    сохраняем все номера рейсов и все авиакомпании
+    в одной записи физического рейса.
+    """
+    groups = {}
+
+    for t, flight in items:
+        key = flight_physical_key(flight)
+
+        if key not in groups:
+            groups[key] = {
+                "time": t,
+                "flight": dict(flight),
+                "numbers": [],
+                "airlines": [],
+            }
+
+        number = flight_number(flight)
+        airline = flight_airline(flight)
+
+        if number and number not in groups[key]["numbers"]:
+            groups[key]["numbers"].append(number)
+
+        if (
+            airline
+            and airline != "—"
+            and airline not in groups[key]["airlines"]
+        ):
+            groups[key]["airlines"].append(airline)
+
+    result = []
+
+    for group in groups.values():
+        merged = group["flight"]
+        merged["_numbers"] = group["numbers"]
+        merged["_airlines"] = group["airlines"]
+        result.append((group["time"], merged))
+
+    return result
+
+
+def flight_is_completed(flight, direction):
+    """
+    CHAORD:
+      A -> прилёт
+      D -> вылет
+
+    CHRMINE:
+      LANDED   -> завершённый прилёт
+      DEPARTED -> завершённый вылет
+    """
+    status = str(
+        flight.get("CHRMINE") or ""
+    ).strip().upper()
+
+    if direction == "A":
+        return status == "LANDED"
+
+    if direction == "D":
+        return status == "DEPARTED"
+
+    return False
+
+
+def actual_flights(
+    flights,
+    direction
+):
+    """
+    ФАКТИЧЕСКИЕ:
+    берём последние реально завершённые рейсы из самого табло IAA.
+
+    Никакого фильтра "за последний час" здесь нет.
+    Именно он раньше обнулял простыню, если источник обновился
+    с задержкой или фактическое время не попадало в наше окно.
+
+    Прилёты:
+        статус LANDED / ARRIVED
+
+    Вылеты:
+        статус DEPARTED / TOOK OFF
+
+    Время фактического рейса:
+        CHPTOL
+
+    После отбора:
+        склеиваем code-share / дубли;
+        сортируем от самого свежего к более старым.
+    """
+
+    result = []
+
+    for flight in flights:
+
+        if flight.get("CHAORD") != direction:
+            continue
+
+        if not flight_is_completed(
+            flight,
+            direction
+        ):
+            continue
+
+        actual_time = parse_flight_time(
+            flight.get("CHPTOL")
+        )
+
+        if actual_time is None:
+            continue
+
+        result.append(
+            (actual_time, flight)
+        )
+
+    result = merge_duplicate_flights(
+        result
+    )
+
+    result.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    return result
+
+
+def upcoming_flights(
+    flights,
+    direction,
+    hours_forward=3
+):
+    """
+    БЛИЖАЙШИЕ:
+    только незавершённые рейсы от текущего момента
+    до +3 часов.
+
+    Если расчётное время уже прошло, но рейс ещё не
+    завершён, он остаётся актуальным только если его
+    CHPTOL всё ещё указывает время не раньше текущего.
+    """
+    now = datetime.now(TZ)
     end = now + timedelta(
         hours=hours_forward
     )
@@ -1330,6 +1465,9 @@ def relevant_flights(
 
     for flight in flights:
         if flight.get("CHAORD") != direction:
+            continue
+
+        if flight_is_completed(flight, direction):
             continue
 
         t = (
@@ -1345,8 +1483,10 @@ def relevant_flights(
         if t is None:
             continue
 
-        if start <= t <= end:
+        if now <= t <= end:
             result.append((t, flight))
+
+    result = merge_duplicate_flights(result)
 
     result.sort(
         key=lambda item: item[0]
@@ -1356,16 +1496,45 @@ def relevant_flights(
 
 
 def make_flight_line(t, flight):
-    number = flight_number(flight)
-    airline = flight_airline(flight)
+    numbers = (
+        flight.get("_numbers")
+        or [flight_number(flight)]
+    )
+
+    airlines = (
+        flight.get("_airlines")
+        or [flight_airline(flight)]
+    )
+
+    numbers = [x for x in numbers if x]
+    airlines = [
+        x for x in airlines
+        if x and x != "—"
+    ]
+
+    number = (
+        " / ".join(numbers)
+        if numbers
+        else "—"
+    )
+
+    airline = (
+        " / ".join(airlines)
+        if airlines
+        else "—"
+    )
+
     city = flight_city(flight)
     terminal = flight.get("CHTERM")
-    status = flight_status(flight)
-    delay = flight_delay_text(flight)
+
+    status = flight_status_raw(flight)
+    light = flight_status_light(flight)
+
+    delay = delayed_minutes(flight)
 
     line = (
         f"{t.strftime('%H:%M')}  "
-        f"{number}  "
+        f"{number}\n"
         f"{airline}\n"
         f"{city}"
     )
@@ -1373,7 +1542,11 @@ def make_flight_line(t, flight):
     if terminal:
         line += f"  T{terminal}"
 
-    line += f"\n   {status}{delay}"
+    if status:
+        line += f"\n   {light} {status}"
+
+        if delay is not None:
+            line += f" {format_delay(delay)}"
 
     return line
 
@@ -1384,17 +1557,45 @@ def make_flight_line(t, flight):
 
 def make_flights_text(
     flights,
-    direction
+    direction,
+    board_type
 ):
     if direction == "A":
-        title = "🛬 БЕН-ГУРИОН — ПРИЛЁТЫ"
+        icon = "🛬"
+        direction_title = "ПРИЛЁТЫ"
     else:
-        title = "✈️ БЕН-ГУРИОН — ВЫЛЕТЫ"
+        icon = "✈️"
+        direction_title = "ВЫЛЕТЫ"
 
-    selected = relevant_flights(
-        flights,
-        direction
-    )[:25]
+    if board_type == "actual":
+        title = (
+            f"{icon} БЕН-ГУРИОН — "
+            f"{direction_title} — ФАКТИЧЕСКИЕ"
+        )
+
+        selected = actual_flights(
+            flights,
+            direction
+        )[:15]
+
+        empty_text = (
+            "В источнике нет фактически завершённых рейсов."
+        )
+
+    else:
+        title = (
+            f"{icon} БЕН-ГУРИОН — "
+            f"{direction_title} — БЛИЖАЙШИЕ"
+        )
+
+        selected = upcoming_flights(
+            flights,
+            direction
+        )[:25]
+
+        empty_text = (
+            "Нет ближайших рейсов в выбранном интервале."
+        )
 
     lines = [
         title,
@@ -1402,9 +1603,8 @@ def make_flights_text(
     ]
 
     if not selected:
-        lines.append(
-            "Нет рейсов в выбранном интервале."
-        )
+        lines.append(empty_text)
+
     else:
         for t, flight in selected:
             lines.append(
@@ -1435,6 +1635,7 @@ def make_flight_alerts_text(flights):
     alerts = []
 
     for flight in flights:
+
         t = (
             parse_flight_time(
                 flight.get("CHPTOL")
@@ -1451,24 +1652,26 @@ def make_flight_alerts_text(flights):
         if not (start <= t <= end):
             continue
 
-        delay = (
-            flight_delay_minutes(flight)
-            or 0
-        )
+        status = str(
+            flight.get("CHRMINE") or ""
+        ).strip().upper()
 
-        status = (
-            flight.get("CHRMINE")
-            or ""
-        ).upper()
-
+        # Пятая простыня строится ТОЛЬКО по статусу IAA.
+        # Никаких наших вычислений "задержан на X минут".
         problem = (
-            delay >= 20
-            or "DELAY" in status
+            "DELAY" in status
             or "CANCEL" in status
         )
 
         if problem:
-            alerts.append((t, flight))
+            alerts.append(
+                (t, flight)
+            )
+
+    # Дубли склеиваем и в пятой простыне.
+    alerts = merge_duplicate_flights(
+        alerts
+    )
 
     alerts.sort(
         key=lambda item: item[0]
@@ -1483,8 +1686,10 @@ def make_flight_alerts_text(flights):
         lines.append(
             "Существенных задержек и отмен нет."
         )
+
     else:
         for t, flight in alerts[:25]:
+
             direction = (
                 "🛬"
                 if flight.get("CHAORD") == "A"
@@ -1510,48 +1715,129 @@ def make_flight_alerts_text(flights):
 
 
 # ---------------------------------------------------------
-# 2.5. ОБНОВЛЕНИЕ ТРЁХ ПОСТОВ БЕН-ГУРИОНА
+# 2.5. СОЗДАНИЕ / ОБНОВЛЕНИЕ ПЯТИ ПОСТОВ
 # ---------------------------------------------------------
 
-def update_flight_board():
-    print("БЕН-ГУРИОН: получаю табло...")
+def create_flight_board_posts():
+    """
+    При запуске сервера ВСЕ 5 постов создаются заново.
+    Старые message_id не используются.
+    """
+    print(
+        "БЕН-ГУРИОН: создаю 5 новых постов..."
+    )
 
     flights = get_flights()
 
-    arrivals_text = make_flights_text(
-        flights,
-        "A"
-    )
+    posts = [
+        (
+            make_flights_text(
+                flights,
+                "A",
+                "actual"
+            ),
+            ARRIVALS_ACTUAL_MESSAGE_ID_FILE
+        ),
+        (
+            make_flights_text(
+                flights,
+                "A",
+                "next"
+            ),
+            ARRIVALS_NEXT_MESSAGE_ID_FILE
+        ),
+        (
+            make_flights_text(
+                flights,
+                "D",
+                "actual"
+            ),
+            DEPARTURES_ACTUAL_MESSAGE_ID_FILE
+        ),
+        (
+            make_flights_text(
+                flights,
+                "D",
+                "next"
+            ),
+            DEPARTURES_NEXT_MESSAGE_ID_FILE
+        ),
+        (
+            make_flight_alerts_text(
+                flights
+            ),
+            FLIGHT_ALERTS_MESSAGE_ID_FILE
+        ),
+    ]
 
-    departures_text = make_flights_text(
-        flights,
-        "D"
-    )
+    for post_text, id_file in posts:
+        message_id = send_message(
+            post_text
+        )
 
-    alerts_text = make_flight_alerts_text(
-        flights
-    )
-
-    update_persistent_post(
-        arrivals_text,
-        ARRIVALS_MESSAGE_ID_FILE
-    )
-
-    update_persistent_post(
-        departures_text,
-        DEPARTURES_MESSAGE_ID_FILE
-    )
-
-    update_persistent_post(
-        alerts_text,
-        FLIGHT_ALERTS_MESSAGE_ID_FILE
-    )
+        save_id_file(
+            id_file,
+            message_id
+        )
 
     print(
-        "БЕН-ГУРИОН: обновлено:",
-        datetime.now(TZ).strftime("%H:%M")
+        "БЕН-ГУРИОН: 5 новых постов созданы:",
+        datetime.now(TZ).strftime(
+            "%H:%M:%S"
+        )
     )
 
+
+def update_flight_board():
+    # НИКАКОГО редактирования:
+    # каждые 30 минут создаются 5 новых постов.
+    print(
+        "БЕН-ГУРИОН: создаю 5 новых постов..."
+    )
+
+    flights = get_flights()
+
+    posts = [
+        make_flights_text(
+            flights,
+            "A",
+            "actual"
+        ),
+        make_flights_text(
+            flights,
+            "A",
+            "next"
+        ),
+        make_flights_text(
+            flights,
+            "D",
+            "actual"
+        ),
+        make_flights_text(
+            flights,
+            "D",
+            "next"
+        ),
+        make_flight_alerts_text(
+            flights
+        ),
+    ]
+
+    message_ids = []
+
+    for post_text in posts:
+        message_ids.append(
+            send_message(post_text)
+        )
+
+    print(
+        "БЕН-ГУРИОН: созданы 5 новых постов:",
+        datetime.now(TZ).strftime(
+            "%H:%M:%S"
+        )
+    )
+
+    return message_ids
 
 
 # =========================================================
@@ -1867,20 +2153,158 @@ def make_rates_text():
     return "\n".join(lines)
 
 
-def update_rates():
-    message_id = update_persistent_post(
-        make_rates_text(),
-        RATES_MESSAGE_ID_FILE
+def create_rates_post():
+    """
+    При запуске сервера создаём новый валютный пост.
+    """
+    message_id = send_message(
+        make_rates_text()
+    )
+
+    save_id_file(
+        RATES_MESSAGE_ID_FILE,
+        message_id
     )
 
     print(
-        "ВАЛЮТЫ: обновлено:",
+        "ВАЛЮТЫ: создан новый пост:",
         datetime.now(TZ).strftime("%H:%M:%S"),
         "message_id:",
         message_id
     )
 
     return message_id
+
+
+def update_rates():
+    # НИКАКОГО редактирования:
+    # каждое обновление валют — новый пост.
+    message_id = send_message(
+        make_rates_text()
+    )
+
+    print(
+        "ВАЛЮТЫ: создан новый пост:",
+        datetime.now(TZ).strftime("%H:%M:%S"),
+        "message_id:",
+        message_id
+    )
+
+    return message_id
+
+
+# =========================================================
+# МИРОВОЕ ВРЕМЯ
+# | 2.2.4
+# =========================================================
+
+WORLD_CITIES = [
+    ("Гонолулу", "Pacific/Honolulu"),
+    ("Анкоридж", "America/Anchorage"),
+    ("Лос-Анджелес", "America/Los_Angeles"),
+    ("Ванкувер", "America/Vancouver"),
+    ("Денвер", "America/Denver"),
+    ("Чикаго", "America/Chicago"),
+    ("Мехико", "America/Mexico_City"),
+    ("Нью-Йорк", "America/New_York"),
+    ("Торонто", "America/Toronto"),
+    ("Каракас", "America/Caracas"),
+    ("Галифакс", "America/Halifax"),
+    ("Буэнос-Айрес", "America/Argentina/Buenos_Aires"),
+    ("Сан-Паулу", "America/Sao_Paulo"),
+    ("Лондон", "Europe/London"),
+    ("Лиссабон", "Europe/Lisbon"),
+    ("Париж", "Europe/Paris"),
+    ("Берлин", "Europe/Berlin"),
+    ("Рим", "Europe/Rome"),
+    ("Афины", "Europe/Athens"),
+    ("Бухарест", "Europe/Bucharest"),
+    ("Каир", "Africa/Cairo"),
+    ("Иерусалим", "Asia/Jerusalem"),
+    ("Москва", "Europe/Moscow"),
+    ("Эр-Рияд", "Asia/Riyadh"),
+    ("Дубай", "Asia/Dubai"),
+    ("Баку", "Asia/Baku"),
+    ("Тбилиси", "Asia/Tbilisi"),
+    ("Ташкент", "Asia/Tashkent"),
+    ("Алматы", "Asia/Almaty"),
+    ("Бишкек", "Asia/Bishkek"),
+    ("Дели", "Asia/Kolkata"),
+    ("Бангкок", "Asia/Bangkok"),
+    ("Джакарта", "Asia/Jakarta"),
+    ("Пекин", "Asia/Shanghai"),
+    ("Гонконг", "Asia/Hong_Kong"),
+    ("Сингапур", "Asia/Singapore"),
+    ("Токио", "Asia/Tokyo"),
+    ("Сеул", "Asia/Seoul"),
+    ("Сидней", "Australia/Sydney"),
+    ("Окленд", "Pacific/Auckland"),
+]
+
+
+def make_time_text():
+    now_jerusalem = datetime.now(TZ)
+
+    grouped = {}
+
+    for city, zone_name in WORLD_CITIES:
+        try:
+            local_now = datetime.now(
+                ZoneInfo(zone_name)
+            )
+            hhmm = local_now.strftime("%H:%M")
+            grouped.setdefault(
+                hhmm,
+                []
+            ).append(city)
+
+        except Exception:
+            continue
+
+    # Сортируем группы не строково, а по часам/минутам.
+    def time_key(value):
+        h, m = value.split(":")
+        return (int(h), int(m))
+
+    lines = [
+        "🌍 МИРОВОЕ ВРЕМЯ",
+        "",
+        f"📅 {gregorian_date_ru(now_jerusalem.date())}",
+        "",
+    ]
+
+    for hhmm in sorted(
+        grouped.keys(),
+        key=time_key
+    ):
+        cities = ", ".join(
+            grouped[hhmm]
+        )
+
+        lines.append(
+            f"{hhmm} — {cities}"
+        )
+
+    lines.extend([
+        "",
+        f"🕒 Обновлено: {now_jerusalem.strftime('%H:%M:%S')}",
+        "",
+        "@ne_zaika",
+    ])
+
+    return "\n".join(lines)
+
+
+def create_time_post():
+    return send_message(
+        make_time_text()
+    )
+
+
+def update_time_post():
+    # НИКАКОГО редактирования:
+    # каждое обновление — новый пост.
+    return create_time_post()
 
 
 # =========================================================
@@ -1966,30 +2390,58 @@ def check_telegram_commands(offset=None):
 
             elif command == "/arrivals":
                 flights = get_flights()
-                update_persistent_post(
+
+                send_message(
                     make_flights_text(
                         flights,
-                        "A"
-                    ),
-                    ARRIVALS_MESSAGE_ID_FILE
+                        "A",
+                        "actual"
+                    )
                 )
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "A",
+                        "next"
+                    )
+                )
+
                 send_private_reply(
                     chat_id,
-                    "Табло прилётов обновлено."
+                    "Созданы 2 новых поста прилётов."
                 )
 
             elif command == "/departures":
                 flights = get_flights()
-                update_persistent_post(
+
+                send_message(
                     make_flights_text(
                         flights,
-                        "D"
-                    ),
-                    DEPARTURES_MESSAGE_ID_FILE
+                        "D",
+                        "actual"
+                    )
                 )
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "D",
+                        "next"
+                    )
+                )
+
                 send_private_reply(
                     chat_id,
-                    "Табло вылетов обновлено."
+                    "Созданы 2 новых поста вылетов."
+                )
+
+            elif command == "/time":
+                update_time_post()
+
+                send_private_reply(
+                    chat_id,
+                    "Создан новый пост мирового времени."
                 )
 
             elif command == "/flights":
@@ -2044,48 +2496,55 @@ def check_telegram_commands(offset=None):
 # =========================================================
 
 def weather_schedule_key(now):
-    return now.strftime("%Y-%m-%d %H")
+    return now.strftime(
+        "%Y-%m-%d %H"
+    )
 
 
 def flights_schedule_key(now):
-    ten_minute = (now.minute // 10) * 10
+    # Бен-Гурион: ровно :00 и :30
+    half_hour = (
+        0 if now.minute < 30 else 30
+    )
 
     return (
         now.strftime("%Y-%m-%d %H:")
-        + f"{ten_minute:02d}"
+        + f"{half_hour:02d}"
     )
 
 
 def rates_schedule_key(now):
-    if now.hour in (8, 12, 16, 20):
-        return now.strftime("%Y-%m-%d %H")
+    if now.hour in (
+        8, 12, 16, 20
+    ):
+        return now.strftime(
+            "%Y-%m-%d %H"
+        )
 
     return None
 
 
+def time_schedule_key(now):
+    return now.strftime(
+        "%Y-%m-%d %H"
+    )
+
+
 def main():
+    print("=" * 57)
+    print("Версия")
+    print("| 2.2.4")
+    print("=" * 57)
+
     telegram_offset = None
 
-    # =====================================================
-    # СТАРТ СЕРВЕРА — СРАЗУ ОБНОВЛЯЕМ ВСЁ
-    # =====================================================
-
-    print("ДИСПЕТЧЕР ЗАПУСКАЕТСЯ...")
     print(
-        "Файл текущего погодного message_id:",
-        WEATHER_MESSAGE_ID_FILE
-    )
-    print(
-        "Текущий погодный message_id:",
-        load_id_file(WEATHER_MESSAGE_ID_FILE)
+        "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
 
+    # При каждом запуске — новые посты.
     try:
         update_weather()
-        print(
-            "ПОГОДА — ОБНОВЛЕНА ПРИ ЗАПУСКЕ:",
-            datetime.now(TZ).strftime("%H:%M:%S")
-        )
     except Exception as error:
         print(
             "ПОГОДА — ОШИБКА ПРИ ЗАПУСКЕ:",
@@ -2094,10 +2553,6 @@ def main():
 
     try:
         update_flight_board()
-        print(
-            "БЕН-ГУРИОН — ОБНОВЛЕН ПРИ ЗАПУСКЕ:",
-            datetime.now(TZ).strftime("%H:%M:%S")
-        )
     except Exception as error:
         print(
             "БЕН-ГУРИОН — ОШИБКА ПРИ ЗАПУСКЕ:",
@@ -2106,31 +2561,52 @@ def main():
 
     try:
         update_rates()
-        print(
-            "ВАЛЮТЫ — ОБНОВЛЕНЫ ПРИ ЗАПУСКЕ:",
-            datetime.now(TZ).strftime("%H:%M:%S")
-        )
     except Exception as error:
         print(
             "ВАЛЮТЫ — ОШИБКА ПРИ ЗАПУСКЕ:",
             error
         )
 
+    try:
+        update_time_post()
+    except Exception as error:
+        print(
+            "МИРОВОЕ ВРЕМЯ — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
     now = datetime.now(TZ)
 
-    # Текущие интервалы считаем обработанными ИМЕННО ПОСЛЕ
-    # стартового обновления.
-    last_weather_key = weather_schedule_key(now)
-    last_flights_key = flights_schedule_key(now)
-    last_rates_key = None
+    last_weather_key = (
+        weather_schedule_key(now)
+    )
 
-    print("ДИСПЕТЧЕР ЗАПУЩЕН.")
-    print("Погода: при смене часа.")
+    last_flights_key = (
+        flights_schedule_key(now)
+    )
+
+    last_rates_key = (
+        rates_schedule_key(now)
+    )
+
+    last_time_key = (
+        time_schedule_key(now)
+    )
+
     print(
-        "Бен-Гурион: в 00, 10, 20, 30, 40 и 50 минут."
+        "ДИСПЕТЧЕР ЗАПУЩЕН."
     )
     print(
-        "Валюты: в 08:00, 12:00, 16:00 и 20:00."
+        "Погода: новый пост каждый час."
+    )
+    print(
+        "Бен-Гурион: 5 новых постов в :00 и :30."
+    )
+    print(
+        "Валюты: новый пост в 08:00, 12:00, 16:00, 20:00."
+    )
+    print(
+        "Мировое время: новый пост каждый час."
     )
 
     while True:
@@ -2138,67 +2614,91 @@ def main():
         now = datetime.now(TZ)
 
         # ---------------------------------------------
-        # ПОГОДА — ПРИ СМЕНЕ ЧАСА
+        # ПОГОДА — НОВЫЙ ПОСТ КАЖДЫЙ ЧАС
         # ---------------------------------------------
-        current_weather_key = weather_schedule_key(now)
+        current_weather_key = (
+            weather_schedule_key(now)
+        )
 
-        if current_weather_key != last_weather_key:
+        if (
+            current_weather_key
+            != last_weather_key
+        ):
             try:
                 update_weather()
-
-                last_weather_key = current_weather_key
-
-                print(
-                    "ПОГОДА — АВТООБНОВЛЕНИЕ:",
-                    datetime.now(TZ).strftime("%H:%M:%S")
+                last_weather_key = (
+                    current_weather_key
                 )
-
             except Exception as error:
                 print(
-                    "ПОГОДА — ОШИБКА "
-                    "АВТООБНОВЛЕНИЯ:",
+                    "ПОГОДА — ОШИБКА:",
                     error
                 )
 
         # ---------------------------------------------
-        # БЕН-ГУРИОН — СТРОГО ПО ДЕСЯТКАМ МИНУТ
+        # БЕН-ГУРИОН — 5 НОВЫХ ПОСТОВ :00 / :30
         # ---------------------------------------------
-        current_flights_key = flights_schedule_key(now)
+        current_flights_key = (
+            flights_schedule_key(now)
+        )
 
-        if current_flights_key != last_flights_key:
+        if (
+            current_flights_key
+            != last_flights_key
+        ):
             try:
                 update_flight_board()
-
-                last_flights_key = current_flights_key
-
-                print(
-                    "БЕН-ГУРИОН — АВТООБНОВЛЕНИЕ:",
-                    datetime.now(TZ).strftime("%H:%M:%S")
+                last_flights_key = (
+                    current_flights_key
                 )
-
             except Exception as error:
                 print(
-                    "БЕН-ГУРИОН — ОШИБКА "
-                    "АВТООБНОВЛЕНИЯ:",
+                    "БЕН-ГУРИОН — ОШИБКА:",
                     error
                 )
 
         # ---------------------------------------------
-        # ВАЛЮТЫ — 08:00 / 12:00 / 16:00 / 20:00
+        # ВАЛЮТЫ — НОВЫЙ ПОСТ 08 / 12 / 16 / 20
         # ---------------------------------------------
-        current_rates_key = rates_schedule_key(now)
+        current_rates_key = (
+            rates_schedule_key(now)
+        )
 
         if (
             current_rates_key is not None
-            and current_rates_key != last_rates_key
+            and current_rates_key
+            != last_rates_key
         ):
             try:
                 update_rates()
-                last_rates_key = current_rates_key
-
+                last_rates_key = (
+                    current_rates_key
+                )
             except Exception as error:
                 print(
-                    "ВАЛЮТЫ — ОШИБКА АВТООБНОВЛЕНИЯ:",
+                    "ВАЛЮТЫ — ОШИБКА:",
+                    error
+                )
+
+        # ---------------------------------------------
+        # МИРОВОЕ ВРЕМЯ — НОВЫЙ ПОСТ КАЖДЫЙ ЧАС
+        # ---------------------------------------------
+        current_time_key = (
+            time_schedule_key(now)
+        )
+
+        if (
+            current_time_key
+            != last_time_key
+        ):
+            try:
+                update_time_post()
+                last_time_key = (
+                    current_time_key
+                )
+            except Exception as error:
+                print(
+                    "МИРОВОЕ ВРЕМЯ — ОШИБКА:",
                     error
                 )
 
@@ -2206,20 +2706,20 @@ def main():
         # TELEGRAM-КОМАНДЫ
         # ---------------------------------------------
         try:
-            telegram_offset = check_telegram_commands(
-                telegram_offset
+            telegram_offset = (
+                check_telegram_commands(
+                    telegram_offset
+                )
             )
-
         except Exception as error:
             print(
                 "TELEGRAM — ОШИБКА:",
                 error
             )
 
-        # Диспетчер просыпается раз в минуту.
-        # Погода запрашивается только при смене часа.
-        # Бен-Гурион — только при новом 10-минутном интервале.
-        time.sleep(60)
+        time.sleep(
+            SCHEDULER_INTERVAL
+        )
 
 
 # =========================================================
