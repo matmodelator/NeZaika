@@ -1,6 +1,6 @@
 # =========================================================
-# минус Departed
-# | 2.7.2
+# Терминология. -1ч +3ч
+# | 2.8.1
 # =========================================================
 
 
@@ -1535,12 +1535,14 @@ def flight_status_light(flight):
     if "CANCEL" in status:
         return "🔴"
 
+    if status == "NOT FINAL":
+        return "🟡"
+
     if "DELAY" in status:
         return "🟡"
 
     if status in (
         "LANDED",
-        "FINAL",
         "LANDING",
     ):
         return "🔵"
@@ -1548,7 +1550,29 @@ def flight_status_light(flight):
     if status == "DEPARTED":
         return "⚪"
 
+    if status == "FINAL":
+        return "🟢"
+
     return "🟢"
+
+
+def flight_actual_light(flight):
+    """
+    Для ACTUAL-разделов:
+      departures -> ⚪ или 🔴
+      arrivals   -> 🔵 или 🔴
+    """
+    status = flight_status_raw(
+        flight
+    ).upper()
+
+    if "CANCEL" in status:
+        return "🔴"
+
+    if flight.get("direction") == "D":
+        return "⚪"
+
+    return "🔵"
 
 
 def flight_is_cancelled(flight):
@@ -1713,14 +1737,17 @@ def actual_flights(
     direction
 ):
     """
-    ФАКТИЧЕСКИЕ:
-    только по времени.
+    ACTUAL:
+    только по Actual/updated_time.
 
-    Никаких фильтров по статусу.
-    Если updated_time (или scheduled_time, если updated нет)
-    уже прошло — рейс попадает сюда.
+    Окно:
+        now - 1 hour <= Actual <= now
+
+    Scheduled для отбора не используется.
+    Status для отбора не используется.
     """
     now = datetime.now(TZ)
+    start = now - timedelta(hours=1)
     result = []
 
     for flight in flights:
@@ -1731,16 +1758,16 @@ def actual_flights(
         ):
             continue
 
-        t = flight_event_time(
-            flight
+        actual = flight.get(
+            "updated_time"
         )
 
-        if t is None:
+        if actual is None:
             continue
 
-        if t <= now:
+        if start <= actual <= now:
             result.append(
-                (t, flight)
+                (actual, flight)
             )
 
     result = merge_duplicate_flights(
@@ -1761,12 +1788,14 @@ def upcoming_flights(
     hours_forward=3
 ):
     """
-    БЛИЖАЙШИЕ:
-    только по времени.
+    UPCOMING:
+    только по Actual/updated_time.
 
-    Никаких фильтров по статусу.
-    Включая DELAYED / CANCELED / FINAL / ON TIME —
-    если время попадает в окно, рейс показывается.
+    Окно:
+        now < Actual <= now + 3 hours
+
+    Scheduled для отбора не используется.
+    Status для отбора не используется.
     """
     now = datetime.now(TZ)
 
@@ -1784,16 +1813,16 @@ def upcoming_flights(
         ):
             continue
 
-        t = flight_event_time(
-            flight
+        actual = flight.get(
+            "updated_time"
         )
 
-        if t is None:
+        if actual is None:
             continue
 
-        if now < t <= end:
+        if now < actual <= end:
             result.append(
-                (t, flight)
+                (actual, flight)
             )
 
     result = merge_duplicate_flights(
@@ -1813,7 +1842,8 @@ def upcoming_flights(
 
 def make_flight_line(
     t,
-    flight
+    flight,
+    board_type=None
 ):
     numbers = (
         flight.get("_numbers")
@@ -1851,9 +1881,14 @@ def make_flight_line(
         flight
     )
 
-    light = flight_status_light(
-        flight
-    )
+    if board_type == "actual":
+        light = flight_actual_light(
+            flight
+        )
+    else:
+        light = flight_status_light(
+            flight
+        )
 
     plane = flight_direction_icon(
         flight
@@ -1912,7 +1947,7 @@ def make_flight_line(
 
     if scheduled:
         line += (
-            "По графику: "
+            "Scheduled: "
             f"{scheduled.strftime('%d.%m %H:%M')}\n"
         )
 
@@ -1921,7 +1956,7 @@ def make_flight_line(
         and updated != scheduled
     ):
         line += (
-            "Обновлено: "
+            "Actual: "
             f"{updated.strftime('%d.%m %H:%M')}\n"
         )
 
@@ -1931,13 +1966,13 @@ def make_flight_line(
 
     if delay:
         line += (
-            f"Задержка: "
-            f"{delay}\n"
+            f"Delay: "
+            f"{delay.replace(' ч', ' h').replace(' мин', ' min')}\n"
         )
 
     if terminal:
         line += (
-            f"Терминал: "
+            f"Terminal: "
             f"T{terminal}\n"
         )
 
@@ -1947,7 +1982,7 @@ def make_flight_line(
         and counter
     ):
         line += (
-            f"Стойка: "
+            f"Counter: "
             f"{counter}\n"
         )
 
@@ -1956,7 +1991,7 @@ def make_flight_line(
         and gate
     ):
         line += (
-            f"Гейт/диапазон: "
+            f"Gate: "
             f"{gate}\n"
         )
 
@@ -2024,7 +2059,8 @@ def make_flights_text(
             lines.append(
                 make_flight_line(
                     t,
-                    flight
+                    flight,
+                    board_type
                 )
             )
             lines.append("")
