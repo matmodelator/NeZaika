@@ -1,6 +1,6 @@
 # =========================================================
-# Avionio
-# | 2.5.0
+# минус Departed
+# | 2.7.2
 # =========================================================
 
 
@@ -12,6 +12,8 @@ import sys
 import time
 import math
 import re
+import json
+import base64
 import requests
 
 from html.parser import HTMLParser
@@ -19,6 +21,43 @@ from html.parser import HTMLParser
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pyluach.dates import HebrewDate
+
+
+def print_initial_comment():
+    """Печатает верхнюю шапку файла без дублирования текста/версии."""
+    try:
+        with open(__file__, "r", encoding="utf-8") as file:
+            header = []
+            started = False
+
+            for raw_line in file:
+                line = raw_line.rstrip("\n")
+
+                if line.startswith("# ==="):
+                    if not started:
+                        started = True
+                        header.append(line[2:])
+                        continue
+
+                    header.append(line[2:])
+                    break
+
+                if started:
+                    if line.startswith("# "):
+                        header.append(line[2:])
+                    elif line == "#":
+                        header.append("")
+                    else:
+                        break
+
+        if header:
+            print("\n".join(header))
+
+    except Exception as error:
+        print("Шапка файла не прочитана:", error)
+
+
+print_initial_comment()
 
 
 # =========================================================
@@ -1101,38 +1140,24 @@ def update_weather(force_new=False):
 # =========================================================
 # 2. БЕН-ГУРИОН — ТАБЛО РЕЙСОВ
 # =========================================================
-# Независимый сервис.
+# Источник:
+#   https://bengurion.co.il/en
 #
-# Единственный источник данных:
-#   Avionio — русское онлайн-табло TLV
+# ВАЖНО:
+# Серверный HTML визуально рендерит только прилёты,
+# но внутри React Router loaderData уже лежат ОБА массива:
+#   arrivals
+#   departures
 #
-# Никаких данных IAA / data.gov.il / Flightradar24.
-# Никаких придуманных терминалов, гейтов или статусов.
-# Статус выводится ровно в формулировке Avionio.
-#
-# Публикация:
-#   1) прилёты — фактические
-#   2) прилёты — ближайшие
-#   3) вылеты — фактические
-#   4) вылеты — ближайшие
-#   5) изменения
-#
-# Принудительное обновление:
-#   /arrivals
-#   /departures
-#   /flights
-#   CMD: python weather_bot.py flights
+# Поэтому:
+#   - один HTTP-запрос;
+#   - никаких карточек;
+#   - никаких дополнительных API-запросов;
+#   - берём именно данные, которыми bengurion.co.il
+#     заполняет переключатель Arrivals / Departures.
 # =========================================================
 
-AVIONIO_ARRIVALS_URL = (
-    "https://www.avionio.com/ru/airport/TLV/arrivals"
-)
-
-AVIONIO_DEPARTURES_URL = (
-    "https://www.avionio.com/ru/airport/TLV/departures"
-)
-
-FLIGHTS_UPDATE_INTERVAL = 600
+BENGURION_BOARD_URL = "https://bengurion.co.il/en"
 
 ARRIVALS_ACTUAL_MESSAGE_ID_FILE = state_file("arrivals_actual_message_id.txt")
 ARRIVALS_NEXT_MESSAGE_ID_FILE = state_file("arrivals_next_message_id.txt")
@@ -1142,319 +1167,477 @@ FLIGHT_ALERTS_MESSAGE_ID_FILE = state_file("flight_alerts_message_id.txt")
 
 
 # ---------------------------------------------------------
-# 2.1. HTML AVIONIO
+# 2.1. ИЗВЛЕЧЕНИЕ ARRIVALS + DEPARTURES ИЗ REACT LOADER DATA
 # ---------------------------------------------------------
 
-class AvionioTableParser(HTMLParser):
-    """Минимальный парсер строк таблицы Avionio без внешних библиотек."""
-
-    def __init__(self):
-        super().__init__()
-        self.rows = []
-        self._row = None
-        self._cell = None
-        self._cell_parts = []
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-
-        if tag == "tr":
-            self._row = []
-
-        elif tag in ("td", "th") and self._row is not None:
-            self._cell = tag
-            self._cell_parts = []
-
-    def handle_data(self, data):
-        if self._cell is not None:
-            self._cell_parts.append(data)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-
-        if tag in ("td", "th") and self._cell is not None:
-            value = " ".join(
-                " ".join(self._cell_parts).split()
-            ).strip()
-            self._row.append(value)
-            self._cell = None
-            self._cell_parts = []
-
-        elif tag == "tr" and self._row is not None:
-            if self._row:
-                self.rows.append(self._row)
-            self._row = None
-
-
-AVIONIO_MONTHS_RU = {
-    "янв": 1,
-    "фев": 2,
-    "мар": 3,
-    "апр": 4,
-    "май": 5,
-    "мая": 5,
-    "июн": 6,
-    "июл": 7,
-    "авг": 8,
-    "сен": 9,
-    "сент": 9,
-    "окт": 10,
-    "ноя": 11,
-    "дек": 12,
-}
-
-
-def parse_avionio_date(date_text, hhmm):
-    """Дата и время берутся только из колонок Avionio."""
-    text = str(date_text or "").lower().replace(".", " ")
-    parts = text.split()
-
-    if len(parts) < 2:
+def parse_flight_time(value):
+    if not value:
         return None
 
     try:
-        day = int(parts[0])
-        month = AVIONIO_MONTHS_RU.get(parts[1])
+        value = str(value).strip()
 
-        if month is None:
-            return None
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
 
-        hour, minute = [int(x) for x in hhmm.split(":", 1)]
-        now = datetime.now(TZ)
+        dt = datetime.fromisoformat(value)
 
-        # Если Avionio отдал год — используем его буквально.
-        if len(parts) >= 3 and parts[2].isdigit():
-            year = int(parts[2])
-            return datetime(
-                year, month, day, hour, minute,
-                tzinfo=TZ
-            )
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=TZ)
 
-        # В таблице год обычно не печатается. Выбираем календарную
-        # дату, ближайшую к сегодняшней дате Иерусалима.
-        candidates = []
-
-        for year in (now.year - 1, now.year, now.year + 1):
-            try:
-                candidates.append(
-                    datetime(
-                        year, month, day, hour, minute,
-                        tzinfo=TZ
-                    )
-                )
-            except ValueError:
-                pass
-
-        if not candidates:
-            return None
-
-        return min(
-            candidates,
-            key=lambda dt: abs((dt - now).total_seconds())
-        )
+        return dt.astimezone(TZ)
 
     except Exception:
         return None
 
 
-def status_clock_time(flight):
-    """HH:MM из статуса Avionio, если Avionio его указал."""
-    status = str(flight.get("status") or "").strip()
-    match = re.search(r"(\d{1,2}:\d{2})\s*$", status)
+def _extract_react_stream_payload(html):
+    """
+    Находим строку вида:
+      window.__reactRouterContext.streamController.enqueue("....");
+    Внутри неё находится JSON-строка, которая после первого json.loads()
+    превращается во второй JSON — сериализованный loaderData.
+    """
+    pattern = re.compile(
+        r'window\.__reactRouterContext\.streamController\.enqueue'
+        r'\(("(?:\\.|[^"\\])*")\);'
+    )
 
-    if not match:
+    matches = pattern.findall(html)
+
+    if not matches:
+        raise RuntimeError(
+            "bengurion.co.il: React loaderData не найден"
+        )
+
+    # На домашней странице нужный payload большой.
+    # Берём тот, где после распаковки есть ключи flights / arrivals / departures.
+    for encoded_string in matches:
+        try:
+            inner_json = json.loads(encoded_string)
+
+            if (
+                '"flights"' in inner_json
+                and '"arrivals"' in inner_json
+                and '"departures"' in inner_json
+            ):
+                return json.loads(inner_json)
+
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "bengurion.co.il: loaderData найден, "
+        "но flights/arrivals/departures не распознаны"
+    )
+
+
+def _resolve_devalue_ref(serialized, ref, memo=None):
+    """
+    Восстанавливает структуру React Router/devalue.
+
+    serialized — плоский массив.
+    ref — индекс элемента в этом массиве.
+
+    В объектах ключи имеют вид "_439": 4967:
+      439  -> индекс строки-имени поля
+      4967 -> индекс значения.
+    """
+    if memo is None:
+        memo = {}
+
+    if ref in memo:
+        return memo[ref]
+
+    if not isinstance(ref, int):
+        return ref
+
+    if ref < 0 or ref >= len(serialized):
         return None
 
-    scheduled = flight.get("scheduled_time")
+    node = serialized[ref]
+
+    if isinstance(node, dict):
+        result = {}
+        memo[ref] = result
+
+        for raw_key, value_ref in node.items():
+            if (
+                isinstance(raw_key, str)
+                and raw_key.startswith("_")
+                and raw_key[1:].isdigit()
+            ):
+                key_ref = int(raw_key[1:])
+
+                if 0 <= key_ref < len(serialized):
+                    key = serialized[key_ref]
+                else:
+                    key = raw_key
+            else:
+                key = raw_key
+
+            result[str(key)] = _resolve_devalue_ref(
+                serialized,
+                value_ref,
+                memo
+            )
+
+        return result
+
+    if isinstance(node, list):
+        result = []
+        memo[ref] = result
+
+        for item_ref in node:
+            result.append(
+                _resolve_devalue_ref(
+                    serialized,
+                    item_ref,
+                    memo
+                )
+            )
+
+        return result
+
+    # Строка / число / bool / None — это уже само значение.
+    memo[ref] = node
+    return node
+
+
+def _extract_flights_object(serialized):
+    """
+    Ищем строку 'flights', затем объект, который использует
+    её индекс как ключ. Это избавляет нас от жёсткого номера
+    вроде 435 — он может поменяться после пересборки сайта.
+    """
+    flights_key_ref = None
+
+    for index, value in enumerate(serialized):
+        if value == "flights":
+            flights_key_ref = index
+            break
+
+    if flights_key_ref is None:
+        raise RuntimeError(
+            "bengurion.co.il: ключ flights не найден"
+        )
+
+    lookup_key = f"_{flights_key_ref}"
+
+    for node in serialized:
+        if (
+            isinstance(node, dict)
+            and lookup_key in node
+        ):
+            flights_ref = node[lookup_key]
+
+            flights_obj = _resolve_devalue_ref(
+                serialized,
+                flights_ref
+            )
+
+            if (
+                isinstance(flights_obj, dict)
+                and "arrivals" in flights_obj
+                and "departures" in flights_obj
+            ):
+                return flights_obj
+
+    raise RuntimeError(
+        "bengurion.co.il: объект flights не найден"
+    )
+
+
+def normalize_bengurion_flight(row):
+    if not isinstance(row, dict):
+        return None
+
+    direction = str(
+        row.get("CHAORD") or ""
+    ).strip().upper()
+
+    if direction not in ("A", "D"):
+        return None
+
+    scheduled = parse_flight_time(
+        row.get("CHSTOL")
+    )
+
+    updated = parse_flight_time(
+        row.get("CHPTOL")
+    )
 
     if scheduled is None:
         return None
 
-    try:
-        hour, minute = [
-            int(x) for x in match.group(1).split(":")
-        ]
-    except Exception:
-        return None
+    return {
+        "direction": direction,
 
-    # Время в статусе может перескочить через полночь.
-    # Берём ближайшее к плановому времени из трёх соседних дат.
-    variants = []
+        "number": (
+            f"{row.get('CHOPER', '')}"
+            f"{row.get('CHFLTN', '')}"
+        ).strip(),
 
-    for day_shift in (-1, 0, 1):
-        d = scheduled.date() + timedelta(days=day_shift)
-        variants.append(
-            datetime(
-                d.year, d.month, d.day,
-                hour, minute,
-                tzinfo=TZ
-            )
-        )
+        "airline": str(
+            row.get("CHOPERD")
+            or row.get("CHOPER")
+            or "—"
+        ).strip(),
 
-    return min(
-        variants,
-        key=lambda dt: abs((dt - scheduled).total_seconds())
-    )
+        "city": str(
+            row.get("CHLOC1T")
+            or row.get("CHLOC1D")
+            or row.get("CHLOC1")
+            or "—"
+        ).strip(),
+
+        "iata": str(
+            row.get("CHLOC1") or ""
+        ).strip(),
+
+        "country": str(
+            row.get("CHLOCCT") or ""
+        ).strip(),
+
+        "scheduled_time": scheduled,
+        "updated_time": updated,
+
+        "status": str(
+            row.get("CHRMINE") or ""
+        ).strip(),
+
+        "terminal": str(
+            row.get("CHTERM") or ""
+        ).strip(),
+
+        "counter": str(
+            row.get("CHCKZN") or ""
+        ).strip(),
+
+        "gate": str(
+            row.get("CHCINT") or ""
+        ).strip(),
+    }
 
 
-def get_avionio_board(direction):
-    if direction == "A":
-        url = AVIONIO_ARRIVALS_URL
-    elif direction == "D":
-        url = AVIONIO_DEPARTURES_URL
-    else:
-        raise ValueError("Неизвестное направление рейса")
-
+def get_flights():
     response = requests.get(
-        url,
+        BENGURION_BOARD_URL,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/142 Safari/537.36"
+                "AppleWebKit/537.36 "
+                "Chrome/142 Safari/537.36"
             ),
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         },
         timeout=30,
     )
 
     response.raise_for_status()
 
-    parser = AvionioTableParser()
-    parser.feed(response.text)
+    serialized = _extract_react_stream_payload(
+        response.text
+    )
+
+    flights_obj = _extract_flights_object(
+        serialized
+    )
+
+    arrivals_raw = flights_obj.get(
+        "arrivals",
+        []
+    )
+
+    departures_raw = flights_obj.get(
+        "departures",
+        []
+    )
 
     flights = []
 
-    for row in parser.rows:
-        if len(row) < 7:
-            continue
+    for row in arrivals_raw + departures_raw:
+        flight = normalize_bengurion_flight(row)
 
-        hhmm = row[0].strip()
-        date_text = row[1].strip()
+        if flight is not None:
+            flights.append(flight)
 
-        if not re.fullmatch(r"\d{1,2}:\d{2}", hhmm):
-            continue
+    arrivals_count = sum(
+        1 for flight in flights
+        if flight["direction"] == "A"
+    )
 
-        scheduled = parse_avionio_date(
-            date_text,
-            hhmm
-        )
+    departures_count = sum(
+        1 for flight in flights
+        if flight["direction"] == "D"
+    )
 
-        if scheduled is None:
-            continue
-
-        flight = {
-            "direction": direction,
-            "scheduled_time": scheduled,
-            "date_text": date_text,
-            "iata": row[2].strip(),
-            "city": row[3].strip(),
-            "number": row[4].strip(),
-            "airline": row[5].strip(),
-            "status": row[6].strip(),
-        }
-
-        flight["status_time"] = status_clock_time(flight)
-        flights.append(flight)
-
-    if not flights:
+    if arrivals_count == 0:
         raise RuntimeError(
-            "Avionio: таблица TLV получена, но строки рейсов не распознаны"
+            "bengurion.co.il: прилёты не получены"
         )
+
+    if departures_count == 0:
+        raise RuntimeError(
+            "bengurion.co.il: вылеты не получены"
+        )
+
+    print(
+        "БЕН-ГУРИОН / BENGURION.CO.IL:",
+        f"🛬 {arrivals_count}",
+        f"✈️ {departures_count}",
+    )
 
     return flights
 
 
-def get_flights():
-    """Единственный источник рейсов — Avionio."""
-    arrivals = get_avionio_board("A")
-    departures = get_avionio_board("D")
-    return arrivals + departures
-
-
 # ---------------------------------------------------------
-# 2.2. ПОЛЯ / СТАТУС / СВЕТОФОР
+# 2.2. НОРМАЛИЗАЦИЯ / СТАТУС / СВЕТОФОР
 # ---------------------------------------------------------
 
 def flight_number(flight):
-    return str(flight.get("number") or "—").strip()
+    return str(
+        flight.get("number") or "—"
+    ).strip()
 
 
 def flight_airline(flight):
-    return str(flight.get("airline") or "—").strip()
+    return str(
+        flight.get("airline") or "—"
+    ).strip()
 
 
 def flight_city(flight):
-    return str(flight.get("city") or "—").strip()
+    return str(
+        flight.get("city") or "—"
+    ).strip()
 
 
 def flight_status_raw(flight):
-    return str(flight.get("status") or "").strip()
+    return str(
+        flight.get("status") or ""
+    ).strip()
 
 
 def flight_direction_icon(flight):
-    return "🛬" if flight.get("direction") == "A" else "✈️"
+    return (
+        "🛬"
+        if flight.get("direction") == "A"
+        else "✈️"
+    )
 
 
 def flight_status_light(flight):
-    """
-    Светофор оставляем.
-    Цвет определяется только по буквальному статусу Avionio.
-    """
-    status = flight_status_raw(flight).lower()
+    status = flight_status_raw(
+        flight
+    ).upper()
 
-    if status.startswith("прибыл"):
-        return "🔵"
-
-    if status.startswith("вылетел"):
-        return "⚪"
-
-    if "отмен" in status:
+    if "CANCEL" in status:
         return "🔴"
 
-    if status.startswith("по расписанию"):
-        return "🟢"
+    if "DELAY" in status:
+        return "🟡"
 
-    # Ожидается / изменённое расчётное состояние Avionio.
-    return "🟡"
+    if status in (
+        "LANDED",
+        "FINAL",
+        "LANDING",
+    ):
+        return "🔵"
+
+    if status == "DEPARTED":
+        return "⚪"
+
+    return "🟢"
 
 
-def flight_is_completed(flight, direction):
-    if flight.get("direction") != direction:
-        return False
+def flight_is_cancelled(flight):
+    return (
+        "CANCEL"
+        in flight_status_raw(
+            flight
+        ).upper()
+    )
 
-    status = flight_status_raw(flight).lower()
+
+def flight_is_completed(
+    flight,
+    direction
+):
+    status = flight_status_raw(
+        flight
+    ).upper()
 
     if direction == "A":
-        return status.startswith("прибыл")
+        return status in (
+            "LANDED",
+            "FINAL",
+        )
 
-    if direction == "D":
-        return status.startswith("вылетел")
-
-    return False
+    return status == "DEPARTED"
 
 
 def flight_event_time(flight):
-    """Фактическое/ожидаемое время Avionio, иначе плановое."""
     return (
-        flight.get("status_time")
+        flight.get("updated_time")
         or flight.get("scheduled_time")
     )
 
 
+def delay_text(flight):
+    scheduled = flight.get(
+        "scheduled_time"
+    )
+
+    updated = flight.get(
+        "updated_time"
+    )
+
+    if (
+        scheduled is None
+        or updated is None
+    ):
+        return None
+
+    minutes = int(
+        (
+            updated - scheduled
+        ).total_seconds()
+        // 60
+    )
+
+    if minutes <= 0:
+        return None
+
+    hours, mins = divmod(
+        minutes,
+        60
+    )
+
+    if hours and mins:
+        return (
+            f"+{hours} ч "
+            f"{mins} мин"
+        )
+
+    if hours:
+        return f"+{hours} ч"
+
+    return f"+{mins} мин"
+
+
 # ---------------------------------------------------------
-# 2.3. ОТБОР И СКЛЕЙКА CODE-SHARE
+# 2.3. CODE-SHARE / ОТБОР
 # ---------------------------------------------------------
 
-def flight_physical_key(flight):
-    """
-    Склеиваем строки Avionio только когда совпадают:
-    направление, IATA, плановое время и буквальный статус.
-    """
+def physical_flight_key(flight):
     return (
-        str(flight.get("direction") or ""),
-        str(flight.get("iata") or ""),
-        str(flight.get("scheduled_time") or ""),
-        str(flight.get("status") or ""),
+        flight.get("direction"),
+        flight.get("iata"),
+        flight.get("scheduled_time"),
+        flight.get("updated_time"),
+        flight.get("terminal"),
+        flight_status_raw(flight),
     )
 
 
@@ -1462,7 +1645,9 @@ def merge_duplicate_flights(items):
     groups = {}
 
     for t, flight in items:
-        key = flight_physical_key(flight)
+        key = physical_flight_key(
+            flight
+        )
 
         if key not in groups:
             groups[key] = {
@@ -1472,120 +1657,321 @@ def merge_duplicate_flights(items):
                 "airlines": [],
             }
 
-        number = flight_number(flight)
-        airline = flight_airline(flight)
+        number = flight_number(
+            flight
+        )
 
-        if number and number != "—" and number not in groups[key]["numbers"]:
-            groups[key]["numbers"].append(number)
+        airline = flight_airline(
+            flight
+        )
 
-        if airline and airline != "—" and airline not in groups[key]["airlines"]:
-            groups[key]["airlines"].append(airline)
+        if (
+            number
+            and number != "—"
+            and number
+            not in groups[key]["numbers"]
+        ):
+            groups[key]["numbers"].append(
+                number
+            )
+
+        if (
+            airline
+            and airline != "—"
+            and airline
+            not in groups[key]["airlines"]
+        ):
+            groups[key]["airlines"].append(
+                airline
+            )
 
     result = []
 
     for group in groups.values():
         merged = group["flight"]
-        merged["_numbers"] = group["numbers"]
-        merged["_airlines"] = group["airlines"]
-        result.append((group["time"], merged))
+
+        merged["_numbers"] = (
+            group["numbers"]
+        )
+
+        merged["_airlines"] = (
+            group["airlines"]
+        )
+
+        result.append(
+            (
+                group["time"],
+                merged
+            )
+        )
 
     return result
 
 
-def actual_flights(flights, direction):
-    """Последние завершённые рейсы по буквальному статусу Avionio."""
-    result = []
+def actual_flights(
+    flights,
+    direction
+):
+    """
+    ФАКТИЧЕСКИЕ:
+    только по времени.
 
-    for flight in flights:
-        if not flight_is_completed(flight, direction):
-            continue
-
-        t = flight_event_time(flight)
-
-        if t is not None:
-            result.append((t, flight))
-
-    result = merge_duplicate_flights(result)
-    result.sort(key=lambda item: item[0], reverse=True)
-    return result
-
-
-def upcoming_flights(flights, direction, hours_forward=3):
-    """Незавершённые рейсы от сейчас до +3 часов по времени Avionio."""
+    Никаких фильтров по статусу.
+    Если updated_time (или scheduled_time, если updated нет)
+    уже прошло — рейс попадает сюда.
+    """
     now = datetime.now(TZ)
-    end = now + timedelta(hours=hours_forward)
     result = []
 
     for flight in flights:
-        if flight.get("direction") != direction:
+
+        if (
+            flight.get("direction")
+            != direction
+        ):
             continue
 
-        if flight_is_completed(flight, direction):
-            continue
-
-        if "отмен" in flight_status_raw(flight).lower():
-            continue
-
-        t = flight_event_time(flight)
+        t = flight_event_time(
+            flight
+        )
 
         if t is None:
             continue
 
-        if now <= t <= end:
-            result.append((t, flight))
+        if t <= now:
+            result.append(
+                (t, flight)
+            )
 
-    result = merge_duplicate_flights(result)
-    result.sort(key=lambda item: item[0])
+    result = merge_duplicate_flights(
+        result
+    )
+
+    result.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
+    return result
+
+
+def upcoming_flights(
+    flights,
+    direction,
+    hours_forward=3
+):
+    """
+    БЛИЖАЙШИЕ:
+    только по времени.
+
+    Никаких фильтров по статусу.
+    Включая DELAYED / CANCELED / FINAL / ON TIME —
+    если время попадает в окно, рейс показывается.
+    """
+    now = datetime.now(TZ)
+
+    end = now + timedelta(
+        hours=hours_forward
+    )
+
+    result = []
+
+    for flight in flights:
+
+        if (
+            flight.get("direction")
+            != direction
+        ):
+            continue
+
+        t = flight_event_time(
+            flight
+        )
+
+        if t is None:
+            continue
+
+        if now < t <= end:
+            result.append(
+                (t, flight)
+            )
+
+    result = merge_duplicate_flights(
+        result
+    )
+
+    result.sort(
+        key=lambda item: item[0]
+    )
+
     return result
 
 
 # ---------------------------------------------------------
-# 2.4. ФОРМАТИРОВАНИЕ РЕЙСА
+# 2.4. ФОРМАТ РЕЙСА
 # ---------------------------------------------------------
 
-def make_flight_line(t, flight):
-    numbers = flight.get("_numbers") or [flight_number(flight)]
-    airlines = flight.get("_airlines") or [flight_airline(flight)]
-
-    numbers = [x for x in numbers if x and x != "—"]
-    airlines = [x for x in airlines if x and x != "—"]
-
-    number = " / ".join(numbers) if numbers else "—"
-    airline = " / ".join(airlines) if airlines else "—"
-
-    city = flight_city(flight)
-    iata = str(flight.get("iata") or "").strip()
-    status = flight_status_raw(flight)
-    light = flight_status_light(flight)
-    plane = flight_direction_icon(flight)
-    scheduled = flight.get("scheduled_time")
-
-    # Первая строка — плановое время из колонки Time Avionio.
-    if scheduled is not None:
-        clock = scheduled.strftime("%H:%M")
-    else:
-        clock = t.strftime("%H:%M")
-
-    line = (
-        f"{plane} {clock}  {number}\n"
-        f"{airline}\n"
-        f"{city}"
+def make_flight_line(
+    t,
+    flight
+):
+    numbers = (
+        flight.get("_numbers")
+        or [flight_number(flight)]
     )
 
-    if iata:
-        line += f" ({iata})"
+    airlines = (
+        flight.get("_airlines")
+        or [flight_airline(flight)]
+    )
+
+    number = (
+        " / ".join(
+            x for x in numbers
+            if x
+        )
+        or "—"
+    )
+
+    airline = (
+        " / ".join(
+            x for x in airlines
+            if x
+        )
+        or "—"
+    )
+
+    city = flight_city(flight)
+
+    iata = str(
+        flight.get("iata") or ""
+    ).strip()
+
+    status = flight_status_raw(
+        flight
+    )
+
+    light = flight_status_light(
+        flight
+    )
+
+    plane = flight_direction_icon(
+        flight
+    )
+
+    scheduled = flight.get(
+        "scheduled_time"
+    )
+
+    updated = flight.get(
+        "updated_time"
+    )
+
+    terminal = str(
+        flight.get("terminal") or ""
+    ).strip()
+
+    counter = str(
+        flight.get("counter") or ""
+    ).strip()
+
+    gate = str(
+        flight.get("gate") or ""
+    ).strip()
+
+    line = (
+        f"{plane} "
+        f"{number}  "
+        f"{airline}\n"
+    )
+
+    if flight.get("direction") == "A":
+        line += city
+
+        if iata:
+            line += f" ({iata})"
+
+        line += " → Тель-Авив\n"
+
+    else:
+        line += (
+            "Тель-Авив → "
+            + city
+        )
+
+        if iata:
+            line += f" ({iata})"
+
+        line += "\n"
 
     if status:
-        line += f"\n   {light} {status}"
+        line += (
+            f"{light} "
+            f"{status}\n"
+        )
 
-    return line
+    if scheduled:
+        line += (
+            "По графику: "
+            f"{scheduled.strftime('%d.%m %H:%M')}\n"
+        )
+
+    if (
+        updated
+        and updated != scheduled
+    ):
+        line += (
+            "Обновлено: "
+            f"{updated.strftime('%d.%m %H:%M')}\n"
+        )
+
+    delay = delay_text(
+        flight
+    )
+
+    if delay:
+        line += (
+            f"Задержка: "
+            f"{delay}\n"
+        )
+
+    if terminal:
+        line += (
+            f"Терминал: "
+            f"T{terminal}\n"
+        )
+
+    # Counter / Gate имеют смысл прежде всего для вылета.
+    if (
+        flight.get("direction") == "D"
+        and counter
+    ):
+        line += (
+            f"Стойка: "
+            f"{counter}\n"
+        )
+
+    if (
+        flight.get("direction") == "D"
+        and gate
+    ):
+        line += (
+            f"Гейт/диапазон: "
+            f"{gate}\n"
+        )
+
+    return line.rstrip()
 
 
 # ---------------------------------------------------------
-# 2.5. ТЕКСТ: ПРИЛЁТЫ / ВЫЛЕТЫ / ИЗМЕНЕНИЯ
+# 2.5. ПОСТЫ
 # ---------------------------------------------------------
 
-def make_flights_text(flights, direction, board_type):
+def make_flights_text(
+    flights,
+    direction,
+    board_type
+):
     if direction == "A":
         icon = "🛬"
         direction_title = "ПРИЛЁТЫ"
@@ -1594,38 +1980,62 @@ def make_flights_text(flights, direction, board_type):
         direction_title = "ВЫЛЕТЫ"
 
     if board_type == "actual":
-        title = (
-            f"{icon} БЕН-ГУРИОН — "
-            f"{direction_title} — ФАКТИЧЕСКИЕ"
+        selected = actual_flights(
+            flights,
+            direction
+        )[:15]
+
+        suffix = "ФАКТИЧЕСКИЕ"
+
+        empty_text = (
+            "Нет завершённых "
+            "рейсов в текущем табло."
         )
-        selected = actual_flights(flights, direction)[:15]
-        empty_text = "Avionio не показывает завершённых рейсов в текущей таблице."
 
     else:
-        title = (
-            f"{icon} БЕН-ГУРИОН — "
-            f"{direction_title} — БЛИЖАЙШИЕ"
+        selected = upcoming_flights(
+            flights,
+            direction
+        )[:25]
+
+        suffix = "БЛИЖАЙШИЕ"
+
+        empty_text = (
+            "Нет ближайших рейсов "
+            "в выбранном интервале."
         )
-        selected = upcoming_flights(flights, direction)[:25]
-        empty_text = "В Avionio нет ближайших рейсов в выбранном интервале."
 
     lines = [
-        title,
-        "Источник: Avionio",
+        (
+            f"{icon} БЕН-ГУРИОН — "
+            f"{direction_title} — "
+            f"{suffix}"
+        ),
         "",
     ]
 
     if not selected:
-        lines.append(empty_text)
+        lines.append(
+            empty_text
+        )
+
     else:
         for t, flight in selected:
-            lines.append(make_flight_line(t, flight))
+            lines.append(
+                make_flight_line(
+                    t,
+                    flight
+                )
+            )
+            lines.append("")
 
     now = datetime.now(TZ)
 
     lines.extend([
-        "",
-        f"🕒 Обновлено: {now.strftime('%H:%M:%S')}",
+        (
+            "🕒 Обновлено: "
+            f"{now.strftime('%d.%m %H:%M:%S')}"
+        ),
         "",
         "@ne_zaika",
     ])
@@ -1633,67 +2043,81 @@ def make_flights_text(flights, direction, board_type):
     return "\n".join(lines)
 
 
-def flight_has_avionio_change(flight):
-    """
-    В изменения попадают только состояния, прямо видимые у Avionio:
-    отмена или 'Ожидается HH:MM', отличающееся от планового HH:MM.
-    Никакой собственной величины задержки не рассчитываем и не печатаем.
-    """
-    status = flight_status_raw(flight).lower()
-
-    if "отмен" in status:
-        return True
-
-    if not status.startswith("ожидается"):
-        return False
-
-    status_time = flight.get("status_time")
-    scheduled = flight.get("scheduled_time")
-
-    if status_time is None or scheduled is None:
-        return False
-
-    return status_time != scheduled
-
-
-def make_flight_alerts_text(flights):
+def make_flight_alerts_text(
+    flights
+):
     now = datetime.now(TZ)
-    start = now - timedelta(hours=1)
-    end = now + timedelta(hours=8)
+
+    start = now - timedelta(
+        hours=1
+    )
+
+    end = now + timedelta(
+        hours=8
+    )
+
     alerts = []
 
     for flight in flights:
-        t = flight_event_time(flight)
 
-        if t is None:
+        t = flight_event_time(
+            flight
+        )
+
+        if (
+            t is None
+            or not (
+                start <= t <= end
+            )
+        ):
             continue
 
-        if not (start <= t <= end):
-            continue
+        status = flight_status_raw(
+            flight
+        ).upper()
 
-        if flight_has_avionio_change(flight):
-            alerts.append((t, flight))
+        if (
+            "DELAY" in status
+            or "CANCEL" in status
+        ):
+            alerts.append(
+                (t, flight)
+            )
 
-    alerts = merge_duplicate_flights(alerts)
-    alerts.sort(key=lambda item: item[0])
+    alerts = merge_duplicate_flights(
+        alerts
+    )
+
+    alerts.sort(
+        key=lambda item: item[0]
+    )
 
     lines = [
         "⚠️ БЕН-ГУРИОН — ИЗМЕНЕНИЯ",
-        "Источник: Avionio",
         "",
     ]
 
     if not alerts:
         lines.append(
-            "Avionio не показывает существенных изменений в выбранном интервале."
+            "Задержек и отмен "
+            "в выбранном интервале нет."
         )
+
     else:
         for t, flight in alerts[:25]:
-            lines.append(make_flight_line(t, flight))
+            lines.append(
+                make_flight_line(
+                    t,
+                    flight
+                )
+            )
+            lines.append("")
 
     lines.extend([
-        "",
-        f"🕒 Обновлено: {now.strftime('%H:%M:%S')}",
+        (
+            "🕒 Обновлено: "
+            f"{now.strftime('%d.%m %H:%M:%S')}"
+        ),
         "",
         "@ne_zaika",
     ])
@@ -1701,75 +2125,104 @@ def make_flight_alerts_text(flights):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------
-# 2.6. СОЗДАНИЕ / ОБНОВЛЕНИЕ ПЯТИ ПОСТОВ
-# ---------------------------------------------------------
-
 def create_flight_board_posts():
-    """При запуске создаём пять новых постов."""
-    print("БЕН-ГУРИОН / AVIONIO: создаю 5 новых постов...")
+    print(
+        "БЕН-ГУРИОН / BENGURION.CO.IL: "
+        "создаю 5 новых постов..."
+    )
 
     flights = get_flights()
 
     posts = [
         (
-            make_flights_text(flights, "A", "actual"),
+            make_flights_text(
+                flights,
+                "A",
+                "actual"
+            ),
             ARRIVALS_ACTUAL_MESSAGE_ID_FILE
         ),
         (
-            make_flights_text(flights, "A", "next"),
+            make_flights_text(
+                flights,
+                "A",
+                "next"
+            ),
             ARRIVALS_NEXT_MESSAGE_ID_FILE
         ),
         (
-            make_flights_text(flights, "D", "actual"),
+            make_flights_text(
+                flights,
+                "D",
+                "actual"
+            ),
             DEPARTURES_ACTUAL_MESSAGE_ID_FILE
         ),
         (
-            make_flights_text(flights, "D", "next"),
+            make_flights_text(
+                flights,
+                "D",
+                "next"
+            ),
             DEPARTURES_NEXT_MESSAGE_ID_FILE
         ),
         (
-            make_flight_alerts_text(flights),
+            make_flight_alerts_text(
+                flights
+            ),
             FLIGHT_ALERTS_MESSAGE_ID_FILE
         ),
     ]
 
     for post_text, id_file in posts:
-        message_id = send_message(post_text)
-        save_id_file(id_file, message_id)
+        message_id = send_message(
+            post_text
+        )
 
-    print(
-        "БЕН-ГУРИОН / AVIONIO: 5 новых постов созданы:",
-        datetime.now(TZ).strftime("%H:%M:%S")
-    )
+        save_id_file(
+            id_file,
+            message_id
+        )
 
 
 def update_flight_board():
-    # НИКАКОГО редактирования:
-    # каждые 30 минут создаются 5 новых постов.
-    print("БЕН-ГУРИОН / AVIONIO: создаю 5 новых постов...")
+    print(
+        "БЕН-ГУРИОН / BENGURION.CO.IL: "
+        "создаю 5 новых постов..."
+    )
 
     flights = get_flights()
 
     posts = [
-        make_flights_text(flights, "A", "actual"),
-        make_flights_text(flights, "A", "next"),
-        make_flights_text(flights, "D", "actual"),
-        make_flights_text(flights, "D", "next"),
-        make_flight_alerts_text(flights),
+        make_flights_text(
+            flights,
+            "A",
+            "actual"
+        ),
+        make_flights_text(
+            flights,
+            "A",
+            "next"
+        ),
+        make_flights_text(
+            flights,
+            "D",
+            "actual"
+        ),
+        make_flights_text(
+            flights,
+            "D",
+            "next"
+        ),
+        make_flight_alerts_text(
+            flights
+        ),
     ]
 
-    message_ids = []
-
-    for post_text in posts:
-        message_ids.append(send_message(post_text))
-
-    print(
-        "БЕН-ГУРИОН / AVIONIO: созданы 5 новых постов:",
-        datetime.now(TZ).strftime("%H:%M:%S")
-    )
-
-    return message_ids
+    return [
+        send_message(post)
+        for post in posts
+    ]
 
 
 # =========================================================
@@ -2127,7 +2580,7 @@ def update_rates():
 
 # =========================================================
 # МИРОВОЕ ВРЕМЯ
-# | 2.4.0
+# | 2.4.1
 # =========================================================
 
 WORLD_CITIES = [
@@ -2495,11 +2948,6 @@ def time_schedule_key(now):
 
 
 def main():
-    print("=" * 57)
-    print("Версия")
-    print("| 2.4.0")
-    print("=" * 57)
-
     telegram_offset = None
 
     print(
