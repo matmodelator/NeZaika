@@ -1,6 +1,7 @@
 # =========================================================
-# Терминология. -1ч +3ч
-# | 2.8.1
+# Каждое обновление → новый пост. МИРОВОЕ ВРЕМЯ — без UTC, с переходом даты относительно Иерусалима. БЕН-ГУРИОН — официальный data.gov.il / IAA: Scheduled/Actual, статус, страна, 
+# IATA/аэропорт, Terminal, Check-in, Zone, codeshare, 🛬/✈️.
+# | 3.0.0
 # =========================================================
 
 
@@ -1140,24 +1141,42 @@ def update_weather(force_new=False):
 # =========================================================
 # 2. БЕН-ГУРИОН — ТАБЛО РЕЙСОВ
 # =========================================================
-# Источник:
-#   https://bengurion.co.il/en
+# Источник: официальный открытый набор IAA на data.gov.il
+# resource_id: e83f763b-b7d7-479e-b172-ae981ddc6de5
 #
-# ВАЖНО:
-# Серверный HTML визуально рендерит только прилёты,
-# но внутри React Router loaderData уже лежат ОБА массива:
-#   arrivals
-#   departures
+# Поля IAA:
+#   CHOPER   — код авиакомпании
+#   CHFLTN   — номер рейса
+#   CHOPERD  — авиакомпания
+#   CHSTOL   — Scheduled
+#   CHPTOL   — Actual / актуальное время
+#   CHAORD   — A / D
+#   CHLOC1   — IATA аэропорта
+#   CHLOC1D  — полное название аэропорта
+#   CHLOC1T  — город / короткое название
+#   CHLOCCT  — страна
+#   CHTERM   — Terminal
+#   CHCINT   — Check-in counters
+#   CHCKZN   — Check-in zone
+#   CHRMINE  — Status
 #
-# Поэтому:
-#   - один HTTP-запрос;
-#   - никаких карточек;
-#   - никаких дополнительных API-запросов;
-#   - берём именно данные, которыми bengurion.co.il
-#     заполняет переключатель Arrivals / Departures.
+# Окно табло:
+#   фактические: последний 1 час по CHPTOL
+#   ближайшие:   следующие 3 часа по CHPTOL
+#
+# Завершённость:
+#   A + LANDED   -> фактический прилёт
+#   D + DEPARTED -> фактический вылет
+#
+# Codeshare / дубли склеиваются.
 # =========================================================
 
-BENGURION_BOARD_URL = "https://bengurion.co.il/en"
+DATA_GOV_FLIGHTS_API = (
+    "https://data.gov.il/api/3/action/datastore_search"
+)
+DATA_GOV_FLIGHTS_RESOURCE_ID = (
+    "e83f763b-b7d7-479e-b172-ae981ddc6de5"
+)
 
 ARRIVALS_ACTUAL_MESSAGE_ID_FILE = state_file("arrivals_actual_message_id.txt")
 ARRIVALS_NEXT_MESSAGE_ID_FILE = state_file("arrivals_next_message_id.txt")
@@ -1165,10 +1184,6 @@ DEPARTURES_ACTUAL_MESSAGE_ID_FILE = state_file("departures_actual_message_id.txt
 DEPARTURES_NEXT_MESSAGE_ID_FILE = state_file("departures_next_message_id.txt")
 FLIGHT_ALERTS_MESSAGE_ID_FILE = state_file("flight_alerts_message_id.txt")
 
-
-# ---------------------------------------------------------
-# 2.1. ИЗВЛЕЧЕНИЕ ARRIVALS + DEPARTURES ИЗ REACT LOADER DATA
-# ---------------------------------------------------------
 
 def parse_flight_time(value):
     if not value:
@@ -1182,6 +1197,7 @@ def parse_flight_time(value):
 
         dt = datetime.fromisoformat(value)
 
+        # IAA timestamps in this dataset are local Israel time.
         if dt.tzinfo is None:
             return dt.replace(tzinfo=TZ)
 
@@ -1191,164 +1207,7 @@ def parse_flight_time(value):
         return None
 
 
-def _extract_react_stream_payload(html):
-    """
-    Находим строку вида:
-      window.__reactRouterContext.streamController.enqueue("....");
-    Внутри неё находится JSON-строка, которая после первого json.loads()
-    превращается во второй JSON — сериализованный loaderData.
-    """
-    pattern = re.compile(
-        r'window\.__reactRouterContext\.streamController\.enqueue'
-        r'\(("(?:\\.|[^"\\])*")\);'
-    )
-
-    matches = pattern.findall(html)
-
-    if not matches:
-        raise RuntimeError(
-            "bengurion.co.il: React loaderData не найден"
-        )
-
-    # На домашней странице нужный payload большой.
-    # Берём тот, где после распаковки есть ключи flights / arrivals / departures.
-    for encoded_string in matches:
-        try:
-            inner_json = json.loads(encoded_string)
-
-            if (
-                '"flights"' in inner_json
-                and '"arrivals"' in inner_json
-                and '"departures"' in inner_json
-            ):
-                return json.loads(inner_json)
-
-        except Exception:
-            continue
-
-    raise RuntimeError(
-        "bengurion.co.il: loaderData найден, "
-        "но flights/arrivals/departures не распознаны"
-    )
-
-
-def _resolve_devalue_ref(serialized, ref, memo=None):
-    """
-    Восстанавливает структуру React Router/devalue.
-
-    serialized — плоский массив.
-    ref — индекс элемента в этом массиве.
-
-    В объектах ключи имеют вид "_439": 4967:
-      439  -> индекс строки-имени поля
-      4967 -> индекс значения.
-    """
-    if memo is None:
-        memo = {}
-
-    if ref in memo:
-        return memo[ref]
-
-    if not isinstance(ref, int):
-        return ref
-
-    if ref < 0 or ref >= len(serialized):
-        return None
-
-    node = serialized[ref]
-
-    if isinstance(node, dict):
-        result = {}
-        memo[ref] = result
-
-        for raw_key, value_ref in node.items():
-            if (
-                isinstance(raw_key, str)
-                and raw_key.startswith("_")
-                and raw_key[1:].isdigit()
-            ):
-                key_ref = int(raw_key[1:])
-
-                if 0 <= key_ref < len(serialized):
-                    key = serialized[key_ref]
-                else:
-                    key = raw_key
-            else:
-                key = raw_key
-
-            result[str(key)] = _resolve_devalue_ref(
-                serialized,
-                value_ref,
-                memo
-            )
-
-        return result
-
-    if isinstance(node, list):
-        result = []
-        memo[ref] = result
-
-        for item_ref in node:
-            result.append(
-                _resolve_devalue_ref(
-                    serialized,
-                    item_ref,
-                    memo
-                )
-            )
-
-        return result
-
-    # Строка / число / bool / None — это уже само значение.
-    memo[ref] = node
-    return node
-
-
-def _extract_flights_object(serialized):
-    """
-    Ищем строку 'flights', затем объект, который использует
-    её индекс как ключ. Это избавляет нас от жёсткого номера
-    вроде 435 — он может поменяться после пересборки сайта.
-    """
-    flights_key_ref = None
-
-    for index, value in enumerate(serialized):
-        if value == "flights":
-            flights_key_ref = index
-            break
-
-    if flights_key_ref is None:
-        raise RuntimeError(
-            "bengurion.co.il: ключ flights не найден"
-        )
-
-    lookup_key = f"_{flights_key_ref}"
-
-    for node in serialized:
-        if (
-            isinstance(node, dict)
-            and lookup_key in node
-        ):
-            flights_ref = node[lookup_key]
-
-            flights_obj = _resolve_devalue_ref(
-                serialized,
-                flights_ref
-            )
-
-            if (
-                isinstance(flights_obj, dict)
-                and "arrivals" in flights_obj
-                and "departures" in flights_obj
-            ):
-                return flights_obj
-
-    raise RuntimeError(
-        "bengurion.co.il: объект flights не найден"
-    )
-
-
-def normalize_bengurion_flight(row):
+def normalize_data_gov_flight(row):
     if not isinstance(row, dict):
         return None
 
@@ -1363,24 +1222,27 @@ def normalize_bengurion_flight(row):
         row.get("CHSTOL")
     )
 
-    updated = parse_flight_time(
+    actual = parse_flight_time(
         row.get("CHPTOL")
     )
 
     if scheduled is None:
         return None
 
+    operator = str(
+        row.get("CHOPER") or ""
+    ).strip().upper()
+
+    flight_no = str(
+        row.get("CHFLTN") or ""
+    ).strip()
+
     return {
         "direction": direction,
-
-        "number": (
-            f"{row.get('CHOPER', '')}"
-            f"{row.get('CHFLTN', '')}"
-        ).strip(),
-
+        "number": f"{operator}{flight_no}".strip(),
         "airline": str(
             row.get("CHOPERD")
-            or row.get("CHOPER")
+            or operator
             or "—"
         ).strip(),
 
@@ -1391,73 +1253,83 @@ def normalize_bengurion_flight(row):
             or "—"
         ).strip(),
 
+        "airport_name": str(
+            row.get("CHLOC1D")
+            or row.get("CHLOC1T")
+            or ""
+        ).strip(),
+
         "iata": str(
             row.get("CHLOC1") or ""
-        ).strip(),
+        ).strip().upper(),
 
         "country": str(
             row.get("CHLOCCT") or ""
         ).strip(),
 
         "scheduled_time": scheduled,
-        "updated_time": updated,
+        "updated_time": actual,
 
         "status": str(
             row.get("CHRMINE") or ""
-        ).strip(),
+        ).strip().upper(),
 
         "terminal": str(
             row.get("CHTERM") or ""
         ).strip(),
 
-        "counter": str(
-            row.get("CHCKZN") or ""
+        # В data.gov.il это именно стойки регистрации и зона.
+        "checkin": str(
+            row.get("CHCINT") or ""
         ).strip(),
 
-        "gate": str(
-            row.get("CHCINT") or ""
+        "zone": str(
+            row.get("CHCKZN") or ""
         ).strip(),
     }
 
 
 def get_flights():
+    """
+    Получаем весь текущий набор IAA напрямую из CKAN DataStore.
+    Никакого bengurion.co.il и HTML-парсинга.
+    """
     response = requests.get(
-        BENGURION_BOARD_URL,
+        DATA_GOV_FLIGHTS_API,
+        params={
+            "resource_id": DATA_GOV_FLIGHTS_RESOURCE_ID,
+            "limit": 5000,
+        },
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "Chrome/142 Safari/537.36"
+                "AppleWebKit/537.36 Chrome/142 Safari/537.36"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "application/json",
         },
         timeout=30,
     )
 
     response.raise_for_status()
+    payload = response.json()
 
-    serialized = _extract_react_stream_payload(
-        response.text
-    )
+    if not payload.get("success"):
+        raise RuntimeError(
+            "data.gov.il: API вернул success=false"
+        )
 
-    flights_obj = _extract_flights_object(
-        serialized
-    )
+    result = payload.get("result") or {}
+    rows = result.get("records") or []
 
-    arrivals_raw = flights_obj.get(
-        "arrivals",
-        []
-    )
-
-    departures_raw = flights_obj.get(
-        "departures",
-        []
-    )
+    if not rows:
+        raise RuntimeError(
+            "data.gov.il: список рейсов пуст"
+        )
 
     flights = []
 
-    for row in arrivals_raw + departures_raw:
-        flight = normalize_bengurion_flight(row)
+    for row in rows:
+        flight = normalize_data_gov_flight(row)
 
         if flight is not None:
             flights.append(flight)
@@ -1474,16 +1346,17 @@ def get_flights():
 
     if arrivals_count == 0:
         raise RuntimeError(
-            "bengurion.co.il: прилёты не получены"
+            "data.gov.il: прилёты не получены"
         )
 
     if departures_count == 0:
         raise RuntimeError(
-            "bengurion.co.il: вылеты не получены"
+            "data.gov.il: вылеты не получены"
         )
 
     print(
-        "БЕН-ГУРИОН / BENGURION.CO.IL:",
+        "БЕН-ГУРИОН / DATA.GOV.IL:",
+        f"всего {len(flights)}",
         f"🛬 {arrivals_count}",
         f"✈️ {departures_count}",
     )
@@ -1558,9 +1431,10 @@ def flight_status_light(flight):
 
 def flight_actual_light(flight):
     """
-    Для ACTUAL-разделов:
-      departures -> ⚪ или 🔴
-      arrivals   -> 🔵 или 🔴
+    Только для уже фактически завершённых рейсов:
+      D + DEPARTED -> ⚪
+      A + LANDED   -> 🔵
+      CANCELED     -> 🔴
     """
     status = flight_status_raw(
         flight
@@ -1593,10 +1467,7 @@ def flight_is_completed(
     ).upper()
 
     if direction == "A":
-        return status in (
-            "LANDED",
-            "FINAL",
-        )
+        return status == "LANDED"
 
     return status == "DEPARTED"
 
@@ -1613,19 +1484,19 @@ def delay_text(flight):
         "scheduled_time"
     )
 
-    updated = flight.get(
+    actual = flight.get(
         "updated_time"
     )
 
     if (
         scheduled is None
-        or updated is None
+        or actual is None
     ):
         return None
 
     minutes = int(
         (
-            updated - scheduled
+            actual - scheduled
         ).total_seconds()
         // 60
     )
@@ -1640,14 +1511,14 @@ def delay_text(flight):
 
     if hours and mins:
         return (
-            f"+{hours} ч "
-            f"{mins} мин"
+            f"+{hours} h "
+            f"{mins} min"
         )
 
     if hours:
-        return f"+{hours} ч"
+        return f"+{hours} h"
 
-    return f"+{mins} мин"
+    return f"+{mins} min"
 
 
 # ---------------------------------------------------------
@@ -1655,6 +1526,15 @@ def delay_text(flight):
 # ---------------------------------------------------------
 
 def physical_flight_key(flight):
+    """
+    Склейка codeshare остаётся.
+
+    Главные признаки одного физического рейса:
+    направление + аэропорт + Scheduled + Actual +
+    Terminal + Status.
+
+    Номер авиакомпании намеренно НЕ входит в ключ.
+    """
     return (
         flight.get("direction"),
         flight.get("iata"),
@@ -1737,17 +1617,14 @@ def actual_flights(
     direction
 ):
     """
-    ACTUAL:
-    только по Actual/updated_time.
-
-    Окно:
-        now - 1 hour <= Actual <= now
-
-    Scheduled для отбора не используется.
-    Status для отбора не используется.
+    ФАКТИЧЕСКИЕ:
+      окно CHPTOL: now - 1 hour .. now
+      прилёты:     LANDED
+      вылеты:      DEPARTED
     """
     now = datetime.now(TZ)
     start = now - timedelta(hours=1)
+
     result = []
 
     for flight in flights:
@@ -1755,6 +1632,12 @@ def actual_flights(
         if (
             flight.get("direction")
             != direction
+        ):
+            continue
+
+        if not flight_is_completed(
+            flight,
+            direction
         ):
             continue
 
@@ -1788,17 +1671,13 @@ def upcoming_flights(
     hours_forward=3
 ):
     """
-    UPCOMING:
-    только по Actual/updated_time.
+    БЛИЖАЙШИЕ:
+      окно CHPTOL: now .. now + 3 hours
 
-    Окно:
-        now < Actual <= now + 3 hours
-
-    Scheduled для отбора не используется.
-    Status для отбора не используется.
+    Отбор по Actual/CHPTOL.
+    Status показывается как его отдаёт IAA.
     """
     now = datetime.now(TZ)
-
     end = now + timedelta(
         hours=hours_forward
     )
@@ -1840,6 +1719,39 @@ def upcoming_flights(
 # 2.4. ФОРМАТ РЕЙСА
 # ---------------------------------------------------------
 
+def airport_display(flight):
+    city = flight_city(flight)
+
+    airport_name = str(
+        flight.get("airport_name") or ""
+    ).strip()
+
+    iata = str(
+        flight.get("iata") or ""
+    ).strip()
+
+    country = str(
+        flight.get("country") or ""
+    ).strip()
+
+    # Если полное название совпадает с коротким, не дублируем.
+    if (
+        airport_name
+        and airport_name.upper() != city.upper()
+    ):
+        place = f"{city} — {airport_name}"
+    else:
+        place = city
+
+    if iata:
+        place += f" ({iata})"
+
+    if country:
+        place += f", {country}"
+
+    return place
+
+
 def make_flight_line(
     t,
     flight,
@@ -1871,11 +1783,9 @@ def make_flight_line(
         or "—"
     )
 
-    city = flight_city(flight)
-
-    iata = str(
-        flight.get("iata") or ""
-    ).strip()
+    place = airport_display(
+        flight
+    )
 
     status = flight_status_raw(
         flight
@@ -1898,7 +1808,7 @@ def make_flight_line(
         "scheduled_time"
     )
 
-    updated = flight.get(
+    actual = flight.get(
         "updated_time"
     )
 
@@ -1906,12 +1816,12 @@ def make_flight_line(
         flight.get("terminal") or ""
     ).strip()
 
-    counter = str(
-        flight.get("counter") or ""
+    checkin = str(
+        flight.get("checkin") or ""
     ).strip()
 
-    gate = str(
-        flight.get("gate") or ""
+    zone = str(
+        flight.get("zone") or ""
     ).strip()
 
     line = (
@@ -1921,23 +1831,13 @@ def make_flight_line(
     )
 
     if flight.get("direction") == "A":
-        line += city
-
-        if iata:
-            line += f" ({iata})"
-
-        line += " → Тель-Авив\n"
-
+        line += (
+            f"{place} → Тель-Авив\n"
+        )
     else:
         line += (
-            "Тель-Авив → "
-            + city
+            f"Тель-Авив → {place}\n"
         )
-
-        if iata:
-            line += f" ({iata})"
-
-        line += "\n"
 
     if status:
         line += (
@@ -1951,13 +1851,10 @@ def make_flight_line(
             f"{scheduled.strftime('%d.%m %H:%M')}\n"
         )
 
-    if (
-        updated
-        and updated != scheduled
-    ):
+    if actual:
         line += (
             "Actual: "
-            f"{updated.strftime('%d.%m %H:%M')}\n"
+            f"{actual.strftime('%d.%m %H:%M')}\n"
         )
 
     delay = delay_text(
@@ -1966,33 +1863,30 @@ def make_flight_line(
 
     if delay:
         line += (
-            f"Delay: "
-            f"{delay.replace(' ч', ' h').replace(' мин', ' min')}\n"
+            f"Delay: {delay}\n"
         )
 
     if terminal:
         line += (
-            f"Terminal: "
-            f"T{terminal}\n"
+            f"Terminal: T{terminal}\n"
         )
 
-    # Counter / Gate имеют смысл прежде всего для вылета.
+    # В наборе IAA нет поля Gate.
+    # CHCINT = Check-in counters, CHCKZN = Check-in zone.
     if (
         flight.get("direction") == "D"
-        and counter
+        and checkin
     ):
         line += (
-            f"Counter: "
-            f"{counter}\n"
+            f"Check-in: {checkin}\n"
         )
 
     if (
         flight.get("direction") == "D"
-        and gate
+        and zone
     ):
         line += (
-            f"Gate: "
-            f"{gate}\n"
+            f"Zone: {zone}\n"
         )
 
     return line.rstrip()
@@ -2023,8 +1917,8 @@ def make_flights_text(
         suffix = "ФАКТИЧЕСКИЕ"
 
         empty_text = (
-            "Нет завершённых "
-            "рейсов в текущем табло."
+            "Нет завершённых рейсов "
+            "за последний час."
         )
 
     else:
@@ -2037,7 +1931,7 @@ def make_flights_text(
 
         empty_text = (
             "Нет ближайших рейсов "
-            "в выбранном интервале."
+            "на следующие 3 часа."
         )
 
     lines = [
@@ -2163,7 +2057,7 @@ def make_flight_alerts_text(
 
 def create_flight_board_posts():
     print(
-        "БЕН-ГУРИОН / BENGURION.CO.IL: "
+        "БЕН-ГУРИОН / DATA.GOV.IL: "
         "создаю 5 новых постов..."
     )
 
@@ -2223,7 +2117,7 @@ def create_flight_board_posts():
 
 def update_flight_board():
     print(
-        "БЕН-ГУРИОН / BENGURION.CO.IL: "
+        "БЕН-ГУРИОН / DATA.GOV.IL: "
         "создаю 5 новых постов..."
     )
 
