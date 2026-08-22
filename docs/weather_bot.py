@@ -1,7 +1,11 @@
 # =========================================================
-# Каждое обновление → новый пост. МИРОВОЕ ВРЕМЯ — без UTC, с переходом даты относительно Иерусалима. БЕН-ГУРИОН — официальный data.gov.il / IAA: Scheduled/Actual, статус, страна, 
-# IATA/аэропорт, Terminal, Check-in, Zone, codeshare, 🛬/✈️.
-# | 3.0.0
+# ближайшие — максимум 25 физических рейсов, но не дальше +3 часов;
+# в шапке каждого поста — число рейсов;
+# в прилётах/вылетах — средний интервал и средняя задержка;
+# в ИЗМЕНЕНИЯ — отдельно средняя задержка прилётов и вылетов;
+# для вылетов — Distance, Estimated flight time, Estimated arrival;
+# для вылетов — прогноз в точке назначения на расчётное время прибытия:
+# | 3.1.0
 # =========================================================
 
 
@@ -11,6 +15,7 @@
 import os
 import sys
 import time
+import threading
 import math
 import re
 import json
@@ -1289,6 +1294,280 @@ def normalize_data_gov_flight(row):
     }
 
 
+
+# ---------------------------------------------------------
+# 2.1.1. АЭРОПОРТЫ / РАССТОЯНИЕ / ETA / ПОГОДА
+# ---------------------------------------------------------
+
+TLV_COORDS = (32.0114, 34.8867)
+
+# Минимальный встроенный справочник популярных направлений.
+# Если IATA отсутствует, Distance/ETA/Weather просто не выводятся.
+AIRPORT_COORDS = {
+    "ATH": (37.9364, 23.9445),
+    "CDG": (49.0097, 2.5479),
+    "LHR": (51.4700, -0.4543),
+    "FCO": (41.8003, 12.2389),
+    "JFK": (40.6413, -73.7781),
+    "EWR": (40.6895, -74.1745),
+    "LAX": (33.9416, -118.4085),
+    "MIA": (25.7959, -80.2870),
+    "BKK": (13.6900, 100.7501),
+    "DXB": (25.2532, 55.3657),
+    "AUH": (24.4330, 54.6511),
+    "LCA": (34.8751, 33.6249),
+    "PFO": (34.7180, 32.4857),
+    "HER": (35.3397, 25.1803),
+    "RHO": (36.4054, 28.0862),
+    "CFU": (39.6019, 19.9117),
+    "VIE": (48.1103, 16.5697),
+    "ZRH": (47.4581, 8.5555),
+    "FRA": (50.0379, 8.5622),
+    "MUC": (48.3538, 11.7861),
+    "BER": (52.3667, 13.5033),
+    "AMS": (52.3105, 4.7683),
+    "BRU": (50.9010, 4.4844),
+    "MAD": (40.4983, -3.5676),
+    "BCN": (41.2974, 2.0833),
+    "LIS": (38.7742, -9.1342),
+    "PRG": (50.1008, 14.2600),
+    "BUD": (47.4399, 19.2610),
+    "WAW": (52.1657, 20.9671),
+    "KRK": (50.0777, 19.7848),
+    "SOF": (42.6952, 23.4062),
+    "VAR": (43.2321, 27.8251),
+    "BOJ": (42.5696, 27.5152),
+    "OTP": (44.5711, 26.0850),
+    "BEG": (44.8184, 20.3091),
+    "TIV": (42.4047, 18.7233),
+    "TIA": (41.4147, 19.7206),
+    "BUS": (41.6103, 41.5997),
+    "TBS": (41.6692, 44.9547),
+    "IST": (41.2753, 28.7519),
+    "SAW": (40.8986, 29.3092),
+}
+
+_weather_cache = {}
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(p1)
+        * math.cos(p2)
+        * math.sin(dlon / 2) ** 2
+    )
+
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def estimate_flight_minutes(distance_km):
+    """
+    Грубая оценка:
+    крейсер ~800 км/ч + 35 мин на набор/снижение/маршрут.
+    """
+    return max(
+        45,
+        int(round(distance_km / 800 * 60 + 35))
+    )
+
+
+def compass_16(degrees):
+    if degrees is None:
+        return ""
+
+    names = [
+        "N", "NNE", "NE", "ENE",
+        "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW",
+        "W", "WNW", "NW", "NNW",
+    ]
+
+    index = int((float(degrees) + 11.25) // 22.5) % 16
+    return names[index]
+
+
+def destination_metrics(flight):
+    if flight.get("direction") != "D":
+        return None
+
+    iata = str(
+        flight.get("iata") or ""
+    ).strip().upper()
+
+    coords = AIRPORT_COORDS.get(iata)
+
+    if not coords:
+        return None
+
+    distance = haversine_km(
+        TLV_COORDS[0],
+        TLV_COORDS[1],
+        coords[0],
+        coords[1],
+    )
+
+    departure = (
+        flight.get("updated_time")
+        or flight.get("scheduled_time")
+    )
+
+    if departure is None:
+        return None
+
+    duration_min = estimate_flight_minutes(
+        distance
+    )
+
+    eta = departure + timedelta(
+        minutes=duration_min
+    )
+
+    return {
+        "distance_km": int(round(distance)),
+        "duration_min": duration_min,
+        "eta": eta,
+        "lat": coords[0],
+        "lon": coords[1],
+        "iata": iata,
+    }
+
+
+def get_arrival_weather(metrics):
+    if not metrics:
+        return None
+
+    eta = metrics["eta"]
+    cache_key = (
+        metrics["iata"],
+        eta.strftime("%Y-%m-%d %H")
+    )
+
+    if cache_key in _weather_cache:
+        return _weather_cache[cache_key]
+
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": metrics["lat"],
+                "longitude": metrics["lon"],
+                "hourly": (
+                    "temperature_2m,"
+                    "precipitation_probability,"
+                    "wind_speed_10m,"
+                    "wind_direction_10m"
+                ),
+                "timezone": "auto",
+                "forecast_days": 4,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        hourly = data.get("hourly") or {}
+        times = hourly.get("time") or []
+
+        target = eta.strftime("%Y-%m-%dT%H:00")
+
+        if target not in times:
+            _weather_cache[cache_key] = None
+            return None
+
+        i = times.index(target)
+
+        result = {
+            "temperature": (hourly.get("temperature_2m") or [None])[i],
+            "precipitation": (
+                hourly.get("precipitation_probability") or [None]
+            )[i],
+            "wind_speed": (
+                hourly.get("wind_speed_10m") or [None]
+            )[i],
+            "wind_direction": (
+                hourly.get("wind_direction_10m") or [None]
+            )[i],
+        }
+
+        _weather_cache[cache_key] = result
+        return result
+
+    except Exception as error:
+        print(
+            "ПОГОДА АЭРОПОРТА — ОШИБКА:",
+            metrics.get("iata"),
+            error
+        )
+        _weather_cache[cache_key] = None
+        return None
+
+
+def average_interval_minutes(selected):
+    if len(selected) < 2:
+        return None
+
+    times = sorted(
+        t for t, _ in selected
+        if t is not None
+    )
+
+    if len(times) < 2:
+        return None
+
+    intervals = [
+        (b - a).total_seconds() / 60
+        for a, b in zip(
+            times,
+            times[1:]
+        )
+    ]
+
+    if not intervals:
+        return None
+
+    return round(
+        sum(intervals) / len(intervals)
+    )
+
+
+def average_delay_minutes(selected):
+    delays = []
+
+    for _, flight in selected:
+        scheduled = flight.get(
+            "scheduled_time"
+        )
+        actual = flight.get(
+            "updated_time"
+        )
+
+        if (
+            scheduled is None
+            or actual is None
+        ):
+            continue
+
+        minutes = (
+            actual - scheduled
+        ).total_seconds() / 60
+
+        if minutes > 0:
+            delays.append(minutes)
+
+    if not delays:
+        return None
+
+    return round(
+        sum(delays) / len(delays)
+    )
+
 def get_flights():
     """
     Получаем весь текущий набор IAA напрямую из CKAN DataStore.
@@ -1408,8 +1687,47 @@ def flight_status_light(flight):
     if "CANCEL" in status:
         return "🔴"
 
-    if status == "NOT FINAL":
-        return "🟡"
+    scheduled = flight.get(
+        "scheduled_time"
+    )
+
+    actual = flight.get(
+        "updated_time"
+    )
+
+    if status in (
+        "FINAL",
+        "NOT FINAL",
+    ):
+        if (
+            scheduled is not None
+            and actual is not None
+        ):
+            minutes = int(
+                (
+                    actual - scheduled
+                ).total_seconds()
+                // 60
+            )
+
+            if flight.get("direction") == "D":
+                if minutes > 0:
+                    return "🟡"
+                if minutes < 0:
+                    return "🟠"
+                return "🟢"
+
+            # ARRIVALS: отклонение до 15 минут
+            # включительно считается нормальным.
+            if minutes > 15:
+                return "🟡"
+
+            if minutes < -15:
+                return "🟠"
+
+            return "🟢"
+
+        return "🟢"
 
     if "DELAY" in status:
         return "🟡"
@@ -1422,9 +1740,6 @@ def flight_status_light(flight):
 
     if status == "DEPARTED":
         return "⚪"
-
-    if status == "FINAL":
-        return "🟢"
 
     return "🟢"
 
@@ -1501,24 +1816,35 @@ def delay_text(flight):
         // 60
     )
 
-    if minutes <= 0:
+    if minutes == 0:
         return None
 
+    absolute_minutes = abs(minutes)
     hours, mins = divmod(
-        minutes,
+        absolute_minutes,
         60
     )
 
     if hours and mins:
-        return (
-            f"+{hours} h "
+        value = (
+            f"{hours} h "
             f"{mins} min"
         )
+    elif hours:
+        value = f"{hours} h"
+    else:
+        value = f"{mins} min"
 
-    if hours:
-        return f"+{hours} h"
+    if minutes > 0:
+        return (
+            "Delay",
+            f"+{value}"
+        )
 
-    return f"+{mins} min"
+    return (
+        "Early",
+        value
+    )
 
 
 # ---------------------------------------------------------
@@ -1832,11 +2158,11 @@ def make_flight_line(
 
     if flight.get("direction") == "A":
         line += (
-            f"{place} → Тель-Авив\n"
+            f"{place} → Израиль TLV נתב\"ג\n"
         )
     else:
         line += (
-            f"Тель-Авив → {place}\n"
+            f"Израиль TLV נתב\"ג → {place}\n"
         )
 
     if status:
@@ -1851,19 +2177,27 @@ def make_flight_line(
             f"{scheduled.strftime('%d.%m %H:%M')}\n"
         )
 
-    if actual:
+    cancelled = flight_is_cancelled(
+        flight
+    )
+
+    if actual and not cancelled:
         line += (
             "Actual: "
             f"{actual.strftime('%d.%m %H:%M')}\n"
         )
 
-    delay = delay_text(
-        flight
+    timing = (
+        None
+        if cancelled
+        else delay_text(flight)
     )
 
-    if delay:
+    if timing:
+        timing_label, timing_value = timing
         line += (
-            f"Delay: {delay}\n"
+            f"{timing_label}: "
+            f"{timing_value}\n"
         )
 
     if terminal:
@@ -1871,8 +2205,6 @@ def make_flight_line(
             f"Terminal: T{terminal}\n"
         )
 
-    # В наборе IAA нет поля Gate.
-    # CHCINT = Check-in counters, CHCKZN = Check-in zone.
     if (
         flight.get("direction") == "D"
         and checkin
@@ -1888,6 +2220,100 @@ def make_flight_line(
         line += (
             f"Zone: {zone}\n"
         )
+
+    if flight.get("direction") == "D":
+        metrics = destination_metrics(
+            flight
+        )
+
+        if metrics:
+            line += (
+                f"Distance: "
+                f"{metrics['distance_km']:,}"
+                .replace(",", " ")
+                + " km\n"
+            )
+
+            duration = metrics[
+                "duration_min"
+            ]
+
+            h, m = divmod(
+                duration,
+                60
+            )
+
+            if h and m:
+                duration_text = (
+                    f"{h} h {m} min"
+                )
+            elif h:
+                duration_text = (
+                    f"{h} h"
+                )
+            else:
+                duration_text = (
+                    f"{m} min"
+                )
+
+            line += (
+                "Estimated flight time: "
+                f"{duration_text}\n"
+            )
+
+            line += (
+                "Estimated arrival: "
+                f"{metrics['eta'].strftime('%d.%m %H:%M')}\n"
+            )
+
+            weather = get_arrival_weather(
+                metrics
+            )
+
+            if weather:
+                temp = weather.get(
+                    "temperature"
+                )
+                wind_speed = weather.get(
+                    "wind_speed"
+                )
+                wind_direction = weather.get(
+                    "wind_direction"
+                )
+                precipitation = weather.get(
+                    "precipitation"
+                )
+
+                if temp is not None:
+                    line += (
+                        "🌡 Temperature: "
+                        f"{temp:+.0f}°C\n"
+                    )
+
+                if wind_speed is not None:
+                    direction_text = (
+                        compass_16(
+                            wind_direction
+                        )
+                    )
+
+                    line += (
+                        "💨 Wind: "
+                        f"{wind_speed:.0f} km/h"
+                    )
+
+                    if direction_text:
+                        line += (
+                            f", {direction_text}"
+                        )
+
+                    line += "\n"
+
+                if precipitation is not None:
+                    line += (
+                        "🌧 Precipitation: "
+                        f"{precipitation:.0f}%\n"
+                    )
 
     return line.rstrip()
 
@@ -1934,14 +2360,47 @@ def make_flights_text(
             "на следующие 3 часа."
         )
 
+    count = len(selected)
+
+    header = (
+        f"{icon} БЕН-ГУРИОН — "
+        f"{direction_title} — "
+        f"{suffix} "
+        f"({count} рейсов)"
+    )
+
+    stats = []
+
+    avg_interval = average_interval_minutes(
+        selected
+    )
+
+    avg_delay = average_delay_minutes(
+        selected
+    )
+
+    if avg_interval is not None:
+        stats.append(
+            f"Средний интервал: "
+            f"{avg_interval} min"
+        )
+
+    if avg_delay is not None:
+        stats.append(
+            f"Средняя задержка: "
+            f"{avg_delay} min"
+        )
+
     lines = [
-        (
-            f"{icon} БЕН-ГУРИОН — "
-            f"{direction_title} — "
-            f"{suffix}"
-        ),
-        "",
+        header,
     ]
+
+    if stats:
+        lines.extend(
+            stats
+        )
+
+    lines.append("")
 
     if not selected:
         lines.append(
@@ -2006,9 +2465,42 @@ def make_flight_alerts_text(
             flight
         ).upper()
 
+        scheduled = flight.get(
+            "scheduled_time"
+        )
+
+        actual = flight.get(
+            "updated_time"
+        )
+
+        timing_change = False
+
         if (
-            "DELAY" in status
-            or "CANCEL" in status
+            scheduled is not None
+            and actual is not None
+        ):
+            minutes = int(
+                (
+                    actual - scheduled
+                ).total_seconds()
+                // 60
+            )
+
+            if flight.get("direction") == "D":
+                # ВЫЛЕТЫ:
+                # любое раньше/позже = ИЗМЕНЕНИЕ.
+                if minutes != 0:
+                    timing_change = True
+            else:
+                # ПРИЛЁТЫ:
+                # только отклонение более 15 минут.
+                if abs(minutes) > 15:
+                    timing_change = True
+
+        if (
+            "CANCEL" in status
+            or "DELAY" in status
+            or timing_change
         ):
             alerts.append(
                 (t, flight)
@@ -2022,19 +2514,58 @@ def make_flight_alerts_text(
         key=lambda item: item[0]
     )
 
-    lines = [
-        "⚠️ БЕН-ГУРИОН — ИЗМЕНЕНИЯ",
-        "",
+
+    selected = alerts[:25]
+
+    arrivals_only = [
+        item
+        for item in selected
+        if item[1].get("direction") == "A"
     ]
 
-    if not alerts:
+    departures_only = [
+        item
+        for item in selected
+        if item[1].get("direction") == "D"
+    ]
+
+    avg_arrival_delay = average_delay_minutes(
+        arrivals_only
+    )
+
+    avg_departure_delay = average_delay_minutes(
+        departures_only
+    )
+
+    lines = [
+        (
+            "⚠️ БЕН-ГУРИОН — ИЗМЕНЕНИЯ "
+            f"({len(selected)} рейсов)"
+        ),
+    ]
+
+    if avg_arrival_delay is not None:
+        lines.append(
+            "Средняя задержка прилётов: "
+            f"{avg_arrival_delay} min"
+        )
+
+    if avg_departure_delay is not None:
+        lines.append(
+            "Средняя задержка вылетов: "
+            f"{avg_departure_delay} min"
+        )
+
+    lines.append("")
+
+    if not selected:
         lines.append(
             "Задержек и отмен "
             "в выбранном интервале нет."
         )
 
     else:
-        for t, flight in alerts[:25]:
+        for t, flight in selected:
             lines.append(
                 make_flight_line(
                     t,
@@ -2042,6 +2573,8 @@ def make_flight_alerts_text(
                 )
             )
             lines.append("")
+
+    now = datetime.now(TZ)
 
     lines.extend([
         (
@@ -2124,35 +2657,69 @@ def update_flight_board():
     flights = get_flights()
 
     posts = [
-        make_flights_text(
-            flights,
-            "A",
-            "actual"
+        (
+            "ПРИЛЁТЫ — ФАКТИЧЕСКИЕ",
+            make_flights_text(
+                flights,
+                "A",
+                "actual"
+            )
         ),
-        make_flights_text(
-            flights,
-            "A",
-            "next"
+        (
+            "ПРИЛЁТЫ — БЛИЖАЙШИЕ",
+            make_flights_text(
+                flights,
+                "A",
+                "next"
+            )
         ),
-        make_flights_text(
-            flights,
-            "D",
-            "actual"
+        (
+            "ВЫЛЕТЫ — ФАКТИЧЕСКИЕ",
+            make_flights_text(
+                flights,
+                "D",
+                "actual"
+            )
         ),
-        make_flights_text(
-            flights,
-            "D",
-            "next"
+        (
+            "ВЫЛЕТЫ — БЛИЖАЙШИЕ",
+            make_flights_text(
+                flights,
+                "D",
+                "next"
+            )
         ),
-        make_flight_alerts_text(
-            flights
+        (
+            "ИЗМЕНЕНИЯ",
+            make_flight_alerts_text(
+                flights
+            )
         ),
     ]
 
-    return [
-        send_message(post)
-        for post in posts
-    ]
+    message_ids = []
+
+    for post_name, post_text in posts:
+        print(
+            "TELEGRAM:",
+            post_name,
+            f"{len(post_text)} символов"
+        )
+
+        try:
+            message_ids.append(
+                send_message(
+                    post_text
+                )
+            )
+        except Exception as error:
+            print(
+                "TELEGRAM — ОШИБКА:",
+                post_name,
+                error
+            )
+
+    return message_ids
 
 
 # =========================================================
@@ -2837,7 +3404,8 @@ def check_telegram_commands(offset=None):
 #   автоматически обновляется при смене часа.
 #
 # Бен-Гурион:
-#   обновляется независимо каждые 10 минут.
+#   НЕ проверяется минутным циклом;
+#   отдельный таймер запускает обновление только в :00 и :30.
 #
 # Ошибка одного сервиса НЕ останавливает второй.
 # =========================================================
@@ -2848,16 +3416,69 @@ def weather_schedule_key(now):
     )
 
 
-def flights_schedule_key(now):
-    # Бен-Гурион: ровно :00 и :30
-    half_hour = (
-        0 if now.minute < 30 else 30
-    )
+def next_flights_run(now=None):
+    """
+    Следующий запуск табло Бен-Гуриона:
+    строго ближайшие :00 или :30.
+    """
+    if now is None:
+        now = datetime.now(TZ)
 
-    return (
-        now.strftime("%Y-%m-%d %H:")
-        + f"{half_hour:02d}"
-    )
+    if now.minute < 30:
+        target = now.replace(
+            minute=30,
+            second=0,
+            microsecond=0
+        )
+    else:
+        target = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+    return target
+
+
+def flights_scheduler_loop():
+    """
+    Рейсы НЕ участвуют в минутном polling.
+
+    После запуска отдельный поток:
+      1) вычисляет ближайшие :00 / :30;
+      2) спит до этого момента;
+      3) обновляет 5 постов;
+      4) снова вычисляет следующий запуск.
+    """
+    while True:
+        now = datetime.now(TZ)
+        target = next_flights_run(now)
+
+        seconds = max(
+            0,
+            (target - now).total_seconds()
+        )
+
+        print(
+            "БЕН-ГУРИОН: следующее обновление",
+            target.strftime("%d.%m %H:%M")
+        )
+
+        time.sleep(seconds)
+
+        try:
+            update_flight_board()
+        except Exception as error:
+            print(
+                "БЕН-ГУРИОН — ОШИБКА:",
+                error
+            )
+
+        # Не даём циклу повторно схватить ту же границу.
+        time.sleep(1)
 
 
 def rates_schedule_key(now):
@@ -2901,6 +3522,13 @@ def main():
             error
         )
 
+    flights_thread = threading.Thread(
+        target=flights_scheduler_loop,
+        daemon=True,
+        name="ben-gurion-scheduler"
+    )
+    flights_thread.start()
+
     try:
         update_rates()
     except Exception as error:
@@ -2921,10 +3549,6 @@ def main():
 
     last_weather_key = (
         weather_schedule_key(now)
-    )
-
-    last_flights_key = (
-        flights_schedule_key(now)
     )
 
     last_rates_key = (
@@ -2974,28 +3598,6 @@ def main():
             except Exception as error:
                 print(
                     "ПОГОДА — ОШИБКА:",
-                    error
-                )
-
-        # ---------------------------------------------
-        # БЕН-ГУРИОН — 5 НОВЫХ ПОСТОВ :00 / :30
-        # ---------------------------------------------
-        current_flights_key = (
-            flights_schedule_key(now)
-        )
-
-        if (
-            current_flights_key
-            != last_flights_key
-        ):
-            try:
-                update_flight_board()
-                last_flights_key = (
-                    current_flights_key
-                )
-            except Exception as error:
-                print(
-                    "БЕН-ГУРИОН — ОШИБКА:",
                     error
                 )
 
