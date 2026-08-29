@@ -1,6 +1,6 @@
 # =========================================================
-# Добавлены официальные VOA Technology и Economy; VOA NEWS = существующий WORLD Top Stories
-# | 3.7.5
+# Добавлен постоянный пост-сервис с короткими ссылками на актуальные погоду / рейсы / валюты / время
+# | 3.8.0
 # =========================================================
 
 
@@ -413,6 +413,274 @@ def update_persistent_post(text, filename):
             return message_id
 
         raise
+
+
+
+# =========================================================
+# 0.3. СЕРВИСЫ — ПОСТ-НАВИГАТОР
+# | 3.7.6
+# =========================================================
+# Один постоянный пост со ссылками на последние сервисные
+# сообщения. После обновления погоды / рейсов / валют /
+# мирового времени навигатор редактируется автоматически.
+# =========================================================
+
+SERVICES_MESSAGE_ID_FILE = state_file("services_message_id.txt")
+TIME_MESSAGE_ID_FILE = state_file("time_message_id.txt")
+
+
+def telegram_channel_message_url(message_id):
+    if not message_id:
+        return None
+
+    channel_name = str(CHANNEL or "").strip()
+    if channel_name.startswith("@"):
+        channel_name = channel_name[1:]
+
+    if not channel_name:
+        return None
+
+    return f"https://t.me/{channel_name}/{int(message_id)}"
+
+
+def _service_link(label, message_id):
+    url = telegram_channel_message_url(message_id)
+
+    if not url:
+        return f"{label} — пока нет"
+
+    return (
+        f'<a href="{html.escape(url, quote=True)}">'
+        f'{html.escape(label)}</a>'
+    )
+
+
+def make_services_text():
+    weather_id = load_id_file(WEATHER_MESSAGE_ID_FILE)
+
+    arrivals_actual_id = load_id_file(
+        ARRIVALS_ACTUAL_MESSAGE_ID_FILE
+    )
+    arrivals_next_id = load_id_file(
+        ARRIVALS_NEXT_MESSAGE_ID_FILE
+    )
+    departures_actual_id = load_id_file(
+        DEPARTURES_ACTUAL_MESSAGE_ID_FILE
+    )
+    departures_next_id = load_id_file(
+        DEPARTURES_NEXT_MESSAGE_ID_FILE
+    )
+    alerts_id = load_id_file(
+        FLIGHT_ALERTS_MESSAGE_ID_FILE
+    )
+
+    rates_id = load_id_file(RATES_MESSAGE_ID_FILE)
+    time_id = load_id_file(TIME_MESSAGE_ID_FILE)
+
+    lines = [
+        "📌 <b>СЕРВИСЫ СОЛНЕЧНОГО ГОРОДА</b>",
+        "",
+        _service_link("🌤 Погода в Хайфе", weather_id),
+        "",
+        "✈️ <b>БЕН-ГУРИОН</b>",
+        _service_link(
+            "🛬 Прилёты — фактические",
+            arrivals_actual_id
+        ),
+        _service_link(
+            "🛬 Прилёты — ближайшие",
+            arrivals_next_id
+        ),
+        _service_link(
+            "🛫 Вылеты — фактические",
+            departures_actual_id
+        ),
+        _service_link(
+            "🛫 Вылеты — ближайшие",
+            departures_next_id
+        ),
+        _service_link(
+            "⚠️ Изменения",
+            alerts_id
+        ),
+        "",
+        _service_link("💱 Курсы валют", rates_id),
+        _service_link("🌍 Мировое время", time_id),
+        "",
+        (
+            "🕒 Обновлено: "
+            f"{datetime.now(TZ).strftime('%d.%m.%Y %H:%M:%S')}"
+        ),
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(lines)
+
+
+def _send_services_post(text):
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data)
+
+    return data["result"]["message_id"]
+
+
+def _edit_services_post(message_id, text):
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/editMessageText"
+    )
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": CHANNEL,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(data)
+
+    return data["result"]["message_id"]
+
+
+def pin_services_post(message_id):
+    """
+    Пытаемся закрепить навигатор без уведомления.
+    Если у бота нет права pin_messages, работа остальных
+    модулей не прерывается.
+    """
+    try:
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/pinChatMessage"
+        )
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHANNEL,
+                "message_id": message_id,
+                "disable_notification": True,
+            },
+            timeout=20,
+        )
+
+        if response.ok:
+            data = response.json()
+            if data.get("ok"):
+                log_line(
+                    "СЕРВИСЫ: навигационный пост закреплён",
+                    f"message_id={message_id}"
+                )
+                return True
+
+        log_line(
+            "СЕРВИСЫ: закрепление недоступно:",
+            response.text[:300]
+        )
+
+    except Exception as exc:
+        log_line(
+            "СЕРВИСЫ: ошибка закрепления:",
+            exc
+        )
+
+    return False
+
+
+def update_services_post():
+    """
+    Создаёт навигатор один раз, затем только редактирует его.
+    """
+    text = make_services_text()
+    message_id = load_id_file(
+        SERVICES_MESSAGE_ID_FILE
+    )
+
+    if message_id is None:
+        message_id = _send_services_post(text)
+        save_id_file(
+            SERVICES_MESSAGE_ID_FILE,
+            message_id
+        )
+
+        log_line(
+            "СЕРВИСЫ: создан навигационный пост",
+            f"message_id={message_id}"
+        )
+
+        pin_services_post(message_id)
+        return message_id
+
+    try:
+        _edit_services_post(
+            message_id,
+            text
+        )
+
+        log_line(
+            "СЕРВИСЫ: навигационный пост обновлён",
+            f"message_id={message_id}"
+        )
+        return message_id
+
+    except Exception as exc:
+        description = str(exc).lower()
+
+        if (
+            "message to edit not found" in description
+            or "message can't be edited" in description
+            or "message_id_invalid" in description
+            or "400 client error" in description
+        ):
+            new_id = _send_services_post(text)
+            save_id_file(
+                SERVICES_MESSAGE_ID_FILE,
+                new_id
+            )
+
+            log_line(
+                "СЕРВИСЫ: старый пост недоступен; создан новый",
+                f"message_id={new_id}"
+            )
+
+            pin_services_post(new_id)
+            return new_id
+
+        raise
+
+
+def safe_update_services_post():
+    try:
+        return update_services_post()
+    except Exception as exc:
+        log_line(
+            "СЕРВИСЫ — ОШИБКА ОБНОВЛЕНИЯ:",
+            exc
+        )
+        return None
 
 
 # =========================================================
@@ -1326,8 +1594,8 @@ def save_weather_slot(slot):
 
 
 def update_weather(force_new=False):
-    # НИКАКОГО редактирования:
-    # каждое обновление погоды — новый пост.
+    # Каждое обновление погоды — новый пост.
+    # Его message_id сохраняется для поста-навигации.
     now = datetime.now(TZ)
     text = make_weather_text()
 
@@ -1335,10 +1603,17 @@ def update_weather(force_new=False):
         text
     )
 
+    save_id_file(
+        WEATHER_MESSAGE_ID_FILE,
+        message_id
+    )
+
     log_line(
         "ПОГОДА: опубликован новый пост",
         f"message_id={message_id}"
     )
+
+    safe_update_services_post()
 
     return message_id
 
@@ -3137,6 +3412,14 @@ def update_flight_board():
 
     message_ids = []
 
+    state_files = {
+        "ПРИЛЁТЫ — ФАКТИЧЕСКИЕ": ARRIVALS_ACTUAL_MESSAGE_ID_FILE,
+        "ПРИЛЁТЫ — БЛИЖАЙШИЕ": ARRIVALS_NEXT_MESSAGE_ID_FILE,
+        "ВЫЛЕТЫ — ФАКТИЧЕСКИЕ": DEPARTURES_ACTUAL_MESSAGE_ID_FILE,
+        "ВЫЛЕТЫ — БЛИЖАЙШИЕ": DEPARTURES_NEXT_MESSAGE_ID_FILE,
+        "ИЗМЕНЕНИЯ": FLIGHT_ALERTS_MESSAGE_ID_FILE,
+    }
+
     for post_name, post_text in posts:
 
         original_length = len(
@@ -3162,6 +3445,16 @@ def update_flight_board():
                 message_id
             )
 
+            state_filename = state_files.get(
+                post_name
+            )
+
+            if state_filename:
+                save_id_file(
+                    state_filename,
+                    message_id
+                )
+
             print(
                 "БЕН-ГУРИОН:",
                 post_name,
@@ -3179,6 +3472,8 @@ def update_flight_board():
             # ВАЖНО:
             # ошибка одного поста не останавливает следующие.
             continue
+
+    safe_update_services_post()
 
     return message_ids
 
@@ -3520,10 +3815,15 @@ def create_rates_post():
 
 
 def update_rates():
-    # НИКАКОГО редактирования:
-    # каждое обновление валют — новый пост.
+    # Каждое обновление валют — новый пост.
+    # Последний message_id используется в посте-навигации.
     message_id = send_message(
         make_rates_text()
+    )
+
+    save_id_file(
+        RATES_MESSAGE_ID_FILE,
+        message_id
     )
 
     print(
@@ -3532,6 +3832,8 @@ def update_rates():
         "message_id:",
         message_id
     )
+
+    safe_update_services_post()
 
     return message_id
 
@@ -3677,9 +3979,18 @@ def create_time_post():
 
 
 def update_time_post():
-    # НИКАКОГО редактирования:
-    # каждое обновление — новый пост.
-    return create_time_post()
+    # Каждое обновление — новый пост.
+    # Последний message_id используется в посте-навигации.
+    message_id = create_time_post()
+
+    save_id_file(
+        TIME_MESSAGE_ID_FILE,
+        message_id
+    )
+
+    safe_update_services_post()
+
+    return message_id
 
 
 # =========================================================
@@ -6278,7 +6589,20 @@ def check_telegram_commands(offset=None):
         chat_id = message["chat"]["id"]
 
         try:
-            if command == "/weather":
+            if command == "/services":
+                message_id = safe_update_services_post()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Навигация сервисов обновлена. "
+                        f"Пост #{message_id}."
+                        if message_id
+                        else "Не удалось обновить навигацию сервисов."
+                    )
+                )
+
+            elif command == "/weather":
                 weather_message_id = update_weather()
 
                 send_private_reply(
