@@ -1,11 +1,6 @@
 # =========================================================
-# ближайшие — максимум 25 физических рейсов, но не дальше +3 часов;
-# в шапке каждого поста — число рейсов;
-# в прилётах/вылетах — средний интервал и средняя задержка;
-# в ИЗМЕНЕНИЯ — отдельно средняя задержка прилётов и вылетов;
-# для вылетов — Distance, Estimated flight time, Estimated arrival;
-# для вылетов — прогноз в точке назначения на расчётное время прибытия:
-# | 3.1.0
+# Логи планировщиков: конкретная дата и время следующего обновления
+# НОВОСТИ | 3.6.3
 # =========================================================
 
 
@@ -20,9 +15,13 @@ import math
 import re
 import json
 import base64
+import csv
+import html
+import xml.etree.ElementTree as ET
 import requests
 
 from html.parser import HTMLParser
+from urllib.parse import urljoin
 
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -75,6 +74,79 @@ CHANNEL = "@ne_zaika"
 
 TZ = ZoneInfo("Asia/Jerusalem")
 
+# Глобальный безопасный лимит для любого Telegram-поста.
+TELEGRAM_TEXT_LIMIT = 4000
+
+# Все sendMessage проходят через одну очередь.
+# Telegram рекомендует избегать >1 сообщения/сек. в один чат.
+TELEGRAM_SEND_LOCK = threading.Lock()
+TELEGRAM_LAST_SEND_AT = 0.0
+TELEGRAM_MIN_SEND_INTERVAL = 1.10
+
+
+def _telegram_send_post(data, timeout=30, max_retries=8):
+    """
+    Общий шлюз Telegram sendMessage для ВСЕХ модулей.
+    Последовательно отправляет сообщения в канал/чат,
+    выдерживает минимальный интервал и уважает retry_after при HTTP 429.
+    """
+    global TELEGRAM_LAST_SEND_AT
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
+
+    with TELEGRAM_SEND_LOCK:
+        for attempt in range(max_retries + 1):
+            elapsed = time.monotonic() - TELEGRAM_LAST_SEND_AT
+            wait_before = TELEGRAM_MIN_SEND_INTERVAL - elapsed
+
+            if wait_before > 0:
+                time.sleep(wait_before)
+
+            response = requests.post(
+                url,
+                data=data,
+                timeout=timeout,
+            )
+
+            # Отмечаем сам факт попытки, чтобы следующий поток
+            # не отправлял сообщение немедленно следом.
+            TELEGRAM_LAST_SEND_AT = time.monotonic()
+
+            if response.status_code != 429:
+                return response
+
+            retry_after = 1.0
+
+            try:
+                body = response.json()
+                retry_after = float(
+                    (
+                        body.get("parameters")
+                        or {}
+                    ).get("retry_after")
+                    or 1
+                )
+            except Exception:
+                pass
+
+            # Небольшой запас, чтобы не попасть в тот же лимит повторно.
+            retry_after = max(retry_after, 1.0) + 0.25
+
+            print(
+                f"{log_time()} | TELEGRAM 429:",
+                f"retry_after={retry_after:.2f} сек.",
+                f"попытка {attempt + 1}/{max_retries + 1}"
+            )
+
+            time.sleep(retry_after)
+            TELEGRAM_LAST_SEND_AT = time.monotonic()
+
+        return response
+
+
 # Общий цикл диспетчера: одна проверка в минуту.
 SCHEDULER_INTERVAL = 60
 
@@ -86,6 +158,17 @@ def state_file(name):
     return os.path.join(
         BASE_DIR,
         name
+    )
+
+
+def log_time():
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def log_line(*parts):
+    print(
+        f"{log_time()} |",
+        *parts
     )
 
 
@@ -103,33 +186,131 @@ def get_json(url):
 # 0.2. ОБЩИЕ TELEGRAM-ФУНКЦИИ
 # =========================================================
 
+def _truncate_telegram_text(
+    text,
+    limit=TELEGRAM_TEXT_LIMIT
+):
+    """
+    Глобально ограничивает ЛЮБОЙ Telegram-текст.
+
+    Стараемся не резать посередине строки.
+    Если текст уже <= limit, возвращаем без изменений.
+    """
+    if text is None:
+        text = ""
+
+    text = str(text)
+
+    if len(text) <= limit:
+        return text, False
+
+    cut = text[:limit]
+
+    # Если возможно — заканчиваем на последней полной строке.
+    last_newline = cut.rfind("\n")
+
+    if last_newline >= int(limit * 0.75):
+        cut = cut[:last_newline]
+
+    cut = cut.rstrip()
+
+    return cut, True
+
+
 def send_message(text):
+
+    original_length = len(
+        str(text or "")
+    )
+
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    final_length = len(
+        safe_text
+    )
+
+    print(
+        f"{log_time()} | TELEGRAM SEND:",
+        f"{final_length}/{TELEGRAM_TEXT_LIMIT} символов",
+        (
+            f"(исходно {original_length}, ОБРЕЗАНО)"
+            if truncated
+            else "(без обрезки)"
+        )
+    )
 
     url = (
         f"https://api.telegram.org/"
         f"bot{BOT_TOKEN}/sendMessage"
     )
 
-    response = requests.post(
-        url,
+    response = _telegram_send_post(
         data={
             "chat_id": CHANNEL,
-            "text": text,
+            "text": safe_text,
         },
         timeout=30,
     )
+
+    if not response.ok:
+        print(
+            "TELEGRAM SEND — HTTP ОШИБКА:",
+            response.status_code,
+            response.text
+        )
 
     response.raise_for_status()
 
     result = response.json()
 
     if not result.get("ok"):
+        print(
+            "TELEGRAM SEND — API ОШИБКА:",
+            result
+        )
         raise RuntimeError(result)
 
-    return result["result"]["message_id"]
+    message_id = (
+        result["result"]["message_id"]
+    )
+
+    print(
+        "TELEGRAM SEND: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
 
 
 def edit_message(message_id, text):
+
+    original_length = len(
+        str(text or "")
+    )
+
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    final_length = len(
+        safe_text
+    )
+
+    print(
+        f"{log_time()} | TELEGRAM EDIT:",
+        f"{final_length}/{TELEGRAM_TEXT_LIMIT} символов",
+        (
+            f"(исходно {original_length}, ОБРЕЗАНО)"
+            if truncated
+            else "(без обрезки)"
+        )
+    )
 
     url = (
         f"https://api.telegram.org/"
@@ -141,18 +322,37 @@ def edit_message(message_id, text):
         data={
             "chat_id": CHANNEL,
             "message_id": message_id,
-            "text": text,
+            "text": safe_text,
         },
         timeout=30,
     )
+
+    if not response.ok:
+        print(
+            "TELEGRAM EDIT — HTTP ОШИБКА:",
+            response.status_code,
+            response.text
+        )
 
     response.raise_for_status()
     result = response.json()
 
     if not result.get("ok"):
+        print(
+            "TELEGRAM EDIT — API ОШИБКА:",
+            result
+        )
         raise RuntimeError(result)
 
-    edited = result.get("result", {})
+    edited = result.get(
+        "result",
+        {}
+    )
+
+    print(
+        "TELEGRAM EDIT: OK",
+        f"message_id={edited.get('message_id', message_id)}"
+    )
 
     return edited.get(
         "message_id",
@@ -1134,10 +1334,9 @@ def update_weather(force_new=False):
         text
     )
 
-    print(
-        "ПОГОДА: создан новый пост:",
-        message_id,
-        now.strftime("%H:%M:%S")
+    log_line(
+        "ПОГОДА: опубликован новый пост",
+        f"message_id={message_id}"
     )
 
     return message_id
@@ -1301,51 +1500,203 @@ def normalize_data_gov_flight(row):
 
 TLV_COORDS = (32.0114, 34.8867)
 
-# Минимальный встроенный справочник популярных направлений.
-# Если IATA отсутствует, Distance/ETA/Weather просто не выводятся.
-AIRPORT_COORDS = {
-    "ATH": (37.9364, 23.9445),
-    "CDG": (49.0097, 2.5479),
-    "LHR": (51.4700, -0.4543),
-    "FCO": (41.8003, 12.2389),
-    "JFK": (40.6413, -73.7781),
-    "EWR": (40.6895, -74.1745),
-    "LAX": (33.9416, -118.4085),
-    "MIA": (25.7959, -80.2870),
-    "BKK": (13.6900, 100.7501),
-    "DXB": (25.2532, 55.3657),
-    "AUH": (24.4330, 54.6511),
-    "LCA": (34.8751, 33.6249),
-    "PFO": (34.7180, 32.4857),
-    "HER": (35.3397, 25.1803),
-    "RHO": (36.4054, 28.0862),
-    "CFU": (39.6019, 19.9117),
-    "VIE": (48.1103, 16.5697),
-    "ZRH": (47.4581, 8.5555),
-    "FRA": (50.0379, 8.5622),
-    "MUC": (48.3538, 11.7861),
-    "BER": (52.3667, 13.5033),
-    "AMS": (52.3105, 4.7683),
-    "BRU": (50.9010, 4.4844),
-    "MAD": (40.4983, -3.5676),
-    "BCN": (41.2974, 2.0833),
-    "LIS": (38.7742, -9.1342),
-    "PRG": (50.1008, 14.2600),
-    "BUD": (47.4399, 19.2610),
-    "WAW": (52.1657, 20.9671),
-    "KRK": (50.0777, 19.7848),
-    "SOF": (42.6952, 23.4062),
-    "VAR": (43.2321, 27.8251),
-    "BOJ": (42.5696, 27.5152),
-    "OTP": (44.5711, 26.0850),
-    "BEG": (44.8184, 20.3091),
-    "TIV": (42.4047, 18.7233),
-    "TIA": (41.4147, 19.7206),
-    "BUS": (41.6103, 41.5997),
-    "TBS": (41.6692, 44.9547),
-    "IST": (41.2753, 28.7519),
-    "SAW": (40.8986, 29.3092),
-}
+# Полный мировой справочник аэропортов:
+# OurAirports airports.csv, обновляется ежедневно.
+OURAIRPORTS_CSV_URL = (
+    "https://davidmegginson.github.io/"
+    "ourairports-data/airports.csv"
+)
+
+OURAIRPORTS_CACHE_FILE = state_file(
+    "ourairports_airports.csv"
+)
+
+OURAIRPORTS_CACHE_MAX_AGE = (
+    24 * 60 * 60
+)
+
+_airport_coords_cache = None
+
+
+def _ourairports_cache_is_fresh():
+    if not os.path.exists(
+        OURAIRPORTS_CACHE_FILE
+    ):
+        return False
+
+    age = (
+        time.time()
+        - os.path.getmtime(
+            OURAIRPORTS_CACHE_FILE
+        )
+    )
+
+    return (
+        age
+        < OURAIRPORTS_CACHE_MAX_AGE
+    )
+
+
+def _download_ourairports_csv():
+    print(
+        "АЭРОПОРТЫ: обновляю "
+        "полный справочник OurAirports..."
+    )
+
+    response = requests.get(
+        OURAIRPORTS_CSV_URL,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    with open(
+        OURAIRPORTS_CACHE_FILE,
+        "wb"
+    ) as file:
+        file.write(
+            response.content
+        )
+
+    print(
+        "АЭРОПОРТЫ: справочник сохранён:",
+        OURAIRPORTS_CACHE_FILE
+    )
+
+
+def load_airport_coords():
+    """
+    Возвращает:
+        {
+            "CDG": (49.0097, 2.5479),
+            ...
+        }
+
+    Используем только записи с IATA-кодом.
+    Если обновление не удалось, используем
+    уже сохранённый локальный CSV.
+    """
+    global _airport_coords_cache
+
+    if _airport_coords_cache is not None:
+        return _airport_coords_cache
+
+    if not _ourairports_cache_is_fresh():
+        try:
+            _download_ourairports_csv()
+        except Exception as error:
+            print(
+                "АЭРОПОРТЫ — ОШИБКА ОБНОВЛЕНИЯ:",
+                error
+            )
+
+    if not os.path.exists(
+        OURAIRPORTS_CACHE_FILE
+    ):
+        print(
+            "АЭРОПОРТЫ: локального "
+            "справочника нет"
+        )
+        _airport_coords_cache = {}
+        return _airport_coords_cache
+
+    coords = {}
+
+    try:
+        with open(
+            OURAIRPORTS_CACHE_FILE,
+            "r",
+            encoding="utf-8",
+            newline=""
+        ) as file:
+
+            reader = csv.DictReader(
+                file
+            )
+
+            for row in reader:
+                iata = str(
+                    row.get("iata_code")
+                    or ""
+                ).strip().upper()
+
+                if not iata:
+                    continue
+
+                try:
+                    lat = float(
+                        row.get(
+                            "latitude_deg"
+                        )
+                    )
+                    lon = float(
+                        row.get(
+                            "longitude_deg"
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError
+                ):
+                    continue
+
+                # При редких дублях IATA
+                # предпочитаем large/medium airport.
+                airport_type = str(
+                    row.get("type")
+                    or ""
+                ).strip()
+
+                priority = {
+                    "large_airport": 3,
+                    "medium_airport": 2,
+                    "small_airport": 1,
+                }.get(
+                    airport_type,
+                    0
+                )
+
+                previous = coords.get(
+                    iata
+                )
+
+                if (
+                    previous is None
+                    or priority
+                    > previous[2]
+                ):
+                    coords[iata] = (
+                        lat,
+                        lon,
+                        priority,
+                    )
+
+        _airport_coords_cache = {
+            iata: (
+                value[0],
+                value[1]
+            )
+            for iata, value
+            in coords.items()
+        }
+
+        print(
+            "АЭРОПОРТЫ:",
+            len(
+                _airport_coords_cache
+            ),
+            "IATA-кодов загружено"
+        )
+
+        return _airport_coords_cache
+
+    except Exception as error:
+        print(
+            "АЭРОПОРТЫ — ОШИБКА ЧТЕНИЯ:",
+            error
+        )
+        _airport_coords_cache = {}
+        return _airport_coords_cache
+
 
 _weather_cache = {}
 
@@ -1401,9 +1752,17 @@ def destination_metrics(flight):
         flight.get("iata") or ""
     ).strip().upper()
 
-    coords = AIRPORT_COORDS.get(iata)
+    airport_coords = load_airport_coords()
+
+    coords = airport_coords.get(
+        iata
+    )
 
     if not coords:
+        print(
+            "АЭРОПОРТЫ: нет координат для",
+            iata
+        )
         return None
 
     distance = haversine_km(
@@ -1695,7 +2054,12 @@ def flight_status_light(flight):
         "updated_time"
     )
 
+    # Для этих статусов цвет определяем
+    # не по самому слову статуса, а по
+    # фактическому расхождению Actual/Scheduled.
     if status in (
+        "ON TIME",
+        "ONTIME",
         "FINAL",
         "NOT FINAL",
     ):
@@ -1711,14 +2075,19 @@ def flight_status_light(flight):
             )
 
             if flight.get("direction") == "D":
+                # ВЫЛЕТЫ:
+                # любое отличие = изменение.
                 if minutes > 0:
                     return "🟡"
+
                 if minutes < 0:
                     return "🟠"
+
                 return "🟢"
 
-            # ARRIVALS: отклонение до 15 минут
-            # включительно считается нормальным.
+            # ПРИЛЁТЫ:
+            # отклонение до 15 минут включительно
+            # считается нормальным.
             if minutes > 15:
                 return "🟡"
 
@@ -2205,8 +2574,21 @@ def make_flight_line(
             f"Terminal: T{terminal}\n"
         )
 
-    if (
+    show_departure_ops = (
         flight.get("direction") == "D"
+        and board_type not in (
+            "actual",
+            "alerts",
+        )
+    )
+
+    show_departure_extra = (
+        flight.get("direction") == "D"
+        and board_type != "alerts"
+    )
+
+    if (
+        show_departure_ops
         and checkin
     ):
         line += (
@@ -2214,14 +2596,14 @@ def make_flight_line(
         )
 
     if (
-        flight.get("direction") == "D"
+        show_departure_ops
         and zone
     ):
         line += (
             f"Zone: {zone}\n"
         )
 
-    if flight.get("direction") == "D":
+    if show_departure_extra:
         metrics = destination_metrics(
             flight
         )
@@ -2322,6 +2704,30 @@ def make_flight_line(
 # 2.5. ПОСТЫ
 # ---------------------------------------------------------
 
+def flight_interval_text(selected):
+    times = sorted(
+        t for t, _ in selected
+        if t is not None
+    )
+
+    if not times:
+        return None
+
+    first = times[0]
+    last = times[-1]
+
+    if first.date() == last.date():
+        return (
+            f"{first.strftime('%H:%M')}"
+            f"–{last.strftime('%H:%M')}"
+        )
+
+    return (
+        f"{first.strftime('%d.%m %H:%M')}"
+        f"–{last.strftime('%d.%m %H:%M')}"
+    )
+
+
 def make_flights_text(
     flights,
     direction,
@@ -2362,14 +2768,32 @@ def make_flights_text(
 
     count = len(selected)
 
-    header = (
-        f"{icon} БЕН-ГУРИОН — "
-        f"{direction_title} — "
-        f"{suffix} "
-        f"({count} рейсов)"
-    )
+    if board_type == "actual":
+        header = (
+            f"{icon} БЕН-ГУРИОН — "
+            f"{direction_title} — "
+            f"{suffix} (last hour) "
+            f"({count} рейсов)"
+        )
+    else:
+        header = (
+            f"{icon} БЕН-ГУРИОН — "
+            f"{direction_title} — "
+            f"{suffix} "
+            f"({count} рейсов)"
+        )
 
     stats = []
+
+    if board_type != "actual":
+        interval_text = flight_interval_text(
+            selected
+        )
+
+        if interval_text:
+            stats.append(
+                f"Интервал: {interval_text}"
+            )
 
     avg_interval = average_interval_minutes(
         selected
@@ -2488,12 +2912,15 @@ def make_flight_alerts_text(
 
             if flight.get("direction") == "D":
                 # ВЫЛЕТЫ:
-                # любое раньше/позже = ИЗМЕНЕНИЕ.
+                # любое отличие Actual/Scheduled
+                # считается изменением,
+                # даже если Status = ON TIME.
                 if minutes != 0:
                     timing_change = True
             else:
                 # ПРИЛЁТЫ:
-                # только отклонение более 15 минут.
+                # только отклонение более 15 минут,
+                # даже если Status = ON TIME.
                 if abs(minutes) > 15:
                     timing_change = True
 
@@ -2544,6 +2971,15 @@ def make_flight_alerts_text(
         ),
     ]
 
+    interval_text = flight_interval_text(
+        selected
+    )
+
+    if interval_text:
+        lines.append(
+            f"Интервал: {interval_text}"
+        )
+
     if avg_arrival_delay is not None:
         lines.append(
             "Средняя задержка прилётов: "
@@ -2569,7 +3005,8 @@ def make_flight_alerts_text(
             lines.append(
                 make_flight_line(
                     t,
-                    flight
+                    flight,
+                    "alerts"
                 )
             )
             lines.append("")
@@ -2700,24 +3137,47 @@ def update_flight_board():
     message_ids = []
 
     for post_name, post_text in posts:
+
+        original_length = len(
+            post_text
+        )
+
+        print()
         print(
-            "TELEGRAM:",
-            post_name,
-            f"{len(post_text)} символов"
+            "БЕН-ГУРИОН:",
+            post_name
+        )
+        print(
+            "Размер до глобального лимита:",
+            f"{original_length}/{TELEGRAM_TEXT_LIMIT}"
         )
 
         try:
-            message_ids.append(
-                send_message(
-                    post_text
-                )
+            message_id = send_message(
+                post_text
             )
+
+            message_ids.append(
+                message_id
+            )
+
+            print(
+                "БЕН-ГУРИОН:",
+                post_name,
+                "— OK"
+            )
+
         except Exception as error:
             print(
-                "TELEGRAM — ОШИБКА:",
+                "БЕН-ГУРИОН:",
                 post_name,
+                "— ОШИБКА:",
                 error
             )
+
+            # ВАЖНО:
+            # ошибка одного поста не останавливает следующие.
+            continue
 
     return message_ids
 
@@ -3227,18 +3687,2514 @@ def update_time_post():
 # Здесь только маршрутизация команд.
 # Логика погоды и аэропорта остаётся внутри своих блоков.
 # =========================================================
+# 3. НОВОСТИ ХАЙФЫ — МУНИЦИПАЛИТЕТ
+# =========================================================
+
+HAIFA_NEWS_URL = "https://www.haifa.muni.il/haifa-news/"
+HAIFA_NEWS_INTERVAL = 60 * 60
+HAIFA_NEWS_SEEN_FILE = state_file("haifa_news_seen_v3.json")
+HAIFA_NEWS_TRANSLATION_CACHE_FILE = state_file("haifa_news_translation_cache.json")
+HAIFA_NEWS_FIRST_RUN = True
+
+
+class HaifaNewsLinksParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        url = urljoin(HAIFA_NEWS_URL, href)
+        if "/article/" not in url:
+            return
+        if not url.startswith("https://www.haifa.muni.il/"):
+            return
+        url = url.split("#", 1)[0].split("?", 1)[0]
+        if url not in self.links:
+            self.links.append(url)
+
+
+class HaifaArticleTitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.og_title = None
+        self.in_title = False
+        self.title_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = {str(k).lower(): v for k, v in attrs}
+        if tag.lower() == "title":
+            self.in_title = True
+        if tag.lower() == "meta":
+            prop = str(attrs.get("property") or attrs.get("name") or "").lower()
+            content = str(attrs.get("content") or "").strip()
+            if prop in ("og:title", "twitter:title") and content and not self.og_title:
+                self.og_title = content
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title and str(data).strip():
+            self.title_parts.append(str(data).strip())
+
+    def get_title(self):
+        title = self.og_title or " ".join(self.title_parts).strip()
+        for suffix in (" - עיריית חיפה", " : עיריית חיפה", " | עיריית חיפה"):
+            if title.endswith(suffix):
+                title = title[:-len(suffix)].rstrip()
+        return title or "Новая публикация муниципалитета Хайфы"
+
+
+def load_seen_haifa_news():
+    if not os.path.exists(HAIFA_NEWS_SEEN_FILE):
+        return None
+    try:
+        with open(HAIFA_NEWS_SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(str(x) for x in data) if isinstance(data, list) else set()
+    except Exception as error:
+        print("ХАЙФА NEWS — ошибка state:", error)
+        return set()
+
+
+def save_seen_haifa_news(seen):
+    with open(HAIFA_NEWS_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(seen)[-1000:], f, ensure_ascii=False, indent=2)
+
+
+def fetch_haifa_news_links():
+    response = requests.get(
+        HAIFA_NEWS_URL,
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "he,en;q=0.8"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    parser = HaifaNewsLinksParser()
+    parser.feed(response.text)
+    return parser.links
+
+
+def fetch_haifa_article_title(url):
+    response = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "he,en;q=0.8"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    parser = HaifaArticleTitleParser()
+    parser.feed(response.text)
+    return parser.get_title()
+
+
+def load_haifa_translation_cache():
+    if not os.path.exists(
+        HAIFA_NEWS_TRANSLATION_CACHE_FILE
+    ):
+        return {}
+
+    try:
+        with open(
+            HAIFA_NEWS_TRANSLATION_CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception as error:
+        print(
+            "ХАЙФА NEWS — ошибка кэша переводов:",
+            error
+        )
+
+    return {}
+
+
+def save_haifa_translation_cache(cache):
+    try:
+        with open(
+            HAIFA_NEWS_TRANSLATION_CACHE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                cache,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        print(
+            "ХАЙФА NEWS — ошибка записи кэша переводов:",
+            error
+        )
+
+
+def translate_hebrew_title_to_ru(title):
+    """
+    Перевод заголовка иврит -> русский.
+    Используется MyMemory API + локальный кэш.
+    """
+    title = " ".join(
+        str(title or "").split()
+    ).strip()
+
+    if not title:
+        return ""
+
+    cache = load_haifa_translation_cache()
+
+    cached = cache.get(title)
+
+    if cached:
+        return cached
+
+    try:
+        response = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={
+                "q": title,
+                "langpair": "he|ru",
+            },
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64)"
+                )
+            },
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        translated = str(
+            (
+                data.get("responseData")
+                or {}
+            ).get(
+                "translatedText"
+            )
+            or ""
+        ).strip()
+
+        if translated:
+            cache[title] = translated
+            save_haifa_translation_cache(
+                cache
+            )
+            return translated
+
+        print(
+            "ХАЙФА NEWS — перевод пустой:",
+            title
+        )
+
+    except Exception as error:
+        print(
+            "ХАЙФА NEWS — перевод недоступен:",
+            error
+        )
+
+    return title
+
+
+def make_haifa_news_text(title, url):
+    title_ru = translate_hebrew_title_to_ru(title)
+    title_ru = html.escape(str(title_ru))
+    safe_url = html.escape(str(url), quote=True)
+
+    return (
+        "🏙 ХАЙФА — НОВОСТИ МЭРИИ\n\n"
+        f"{title_ru}\n\n"
+        "Source: Haifa Municipality\n"
+        f'<a href="{safe_url}">Оригинал</a>\n\n'
+        "@ne_zaika"
+    )
+
+
+def send_haifa_news_message(text):
+    safe_text, truncated = _truncate_telegram_text(text)
+
+    print(
+        "ХАЙФА NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    return result["result"]["message_id"]
+
+
+def check_haifa_news():
+    links = fetch_haifa_news_links()
+    print("ХАЙФА NEWS: найдено ссылок:", len(links))
+
+    global HAIFA_NEWS_FIRST_RUN
+
+    seen = load_seen_haifa_news()
+    if seen is None:
+        seen = set()
+
+    # При КАЖДОМ новом запуске сервера публикуем 10 последних,
+    # независимо от сохранённого state-файла.
+    first_run = HAIFA_NEWS_FIRST_RUN
+
+    if first_run:
+        new_links = links[:10]
+        print(
+            "ХАЙФА NEWS: первый запуск — публикую последние:",
+            len(new_links)
+        )
+    else:
+        new_links = [
+            url for url in links
+            if url not in seen
+        ]
+
+    if not new_links:
+        print("ХАЙФА NEWS: новых публикаций нет")
+        return 0
+
+    # Лента обычно идёт от новых к старым.
+    # Публикуем от старых к новым, чтобы самая свежая
+    # в итоге оказалась последней в Telegram-ленте.
+    new_links = list(reversed(new_links))
+    published = 0
+
+    print(
+        "ХАЙФА NEWS: к публикации:",
+        len(new_links)
+    )
+
+    for index, url in enumerate(new_links, start=1):
+        try:
+            title = fetch_haifa_article_title(url)
+            send_haifa_news_message(
+                make_haifa_news_text(
+                    title,
+                    url
+                )
+            )
+
+            seen.add(url)
+            save_seen_haifa_news(seen)
+            published += 1
+
+            print(
+                "ХАЙФА NEWS: опубликовано",
+                f"{index}/{len(new_links)}:",
+                url
+            )
+
+            # Не отправляем десятки постов одним мгновенным залпом.
+            if index < len(new_links):
+                time.sleep(1.1)
+
+        except Exception as error:
+            # Неуспешный URL НЕ добавляется в seen —
+            # значит, бот попробует его снова через час.
+            print(
+                "ХАЙФА NEWS — ОШИБКА СТАТЬИ:",
+                url,
+                error
+            )
+
+    if first_run:
+        # После стартовых 10 вся текущая лента считается просмотренной.
+        seen.update(links)
+        save_seen_haifa_news(seen)
+        HAIFA_NEWS_FIRST_RUN = False
+
+    log_line(
+        "ХАЙФА NEWS: опубликовано всего:",
+        published
+    )
+
+    return published
+
+
+def haifa_news_scheduler_loop():
+    first_cycle = True
+
+    while True:
+        if not first_cycle:
+            now = datetime.now(TZ)
+
+            next_run = (
+                now.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
+                + timedelta(hours=1)
+            )
+
+            log_line(
+                "ХАЙФА NEWS: следующее обновление",
+                next_run.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            time.sleep(
+                max(
+                    0,
+                    (next_run - now).total_seconds()
+                )
+            )
+
+        first_cycle = False
+
+        try:
+            log_line("ХАЙФА NEWS: запуск проверки")
+            check_haifa_news()
+            log_line("ХАЙФА NEWS: проверка завершена")
+
+        except Exception as error:
+            log_line(
+                "ХАЙФА NEWS — ОШИБКА:",
+                error
+            )
+
+# =========================================================
+
+
+# =========================================================
+# НОВОСТИ ИЗРАИЛЯ — JERUSALEM POST RSS
+# =========================================================
+# Используется только официальный RSS Jerusalem Post.
+# При каждом запуске сервера: 10 последних.
+# Далее: раз в час все новые.
+# Заголовок RSS не изменяется и не переводится.
+# =========================================================
+
+
+# =========================================================
+# ПЕРЕВОД НОВОСТЕЙ EN -> RU
+# =========================================================
+
+NEWS_TRANSLATION_CACHE_FILE = state_file(
+    "news_translation_cache.json"
+)
+
+NEWS_TRANSLATION_CACHE_LOCK = threading.RLock()
+
+
+def load_news_translation_cache():
+    with NEWS_TRANSLATION_CACHE_LOCK:
+        if not os.path.exists(NEWS_TRANSLATION_CACHE_FILE):
+            return {}
+
+        try:
+            with open(
+                NEWS_TRANSLATION_CACHE_FILE,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                data = json.load(file)
+
+            if isinstance(data, dict):
+                return data
+
+        except Exception as error:
+            log_line(
+                "NEWS TRANSLATE — ошибка чтения кэша:",
+                error
+            )
+
+        return {}
+
+
+def save_news_translation_cache(cache):
+    with NEWS_TRANSLATION_CACHE_LOCK:
+        try:
+            temp_file = NEWS_TRANSLATION_CACHE_FILE + ".tmp"
+
+            with open(
+                temp_file,
+                "w",
+                encoding="utf-8"
+            ) as file:
+                json.dump(
+                    cache,
+                    file,
+                    ensure_ascii=False,
+                    indent=2
+                )
+
+            os.replace(
+                temp_file,
+                NEWS_TRANSLATION_CACHE_FILE
+            )
+
+        except Exception as error:
+            log_line(
+                "NEWS TRANSLATE — ошибка записи кэша:",
+                error
+            )
+
+
+def clean_news_text(value):
+    value = str(value or "")
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = html.unescape(value)
+
+    return " ".join(value.split()).strip()
+
+
+def translate_news_to_ru(value, source_lang="en"):
+    value = clean_news_text(value)
+
+    if not value:
+        return ""
+
+    value = value[:480]
+    key = f"{source_lang}|{value}"
+
+    with NEWS_TRANSLATION_CACHE_LOCK:
+        cache = load_news_translation_cache()
+
+        if cache.get(key):
+            return cache[key]
+
+    try:
+        response = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={
+                "q": value,
+                "langpair": f"{source_lang}|ru",
+            },
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64)"
+                )
+            },
+            timeout=30,
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        translated = clean_news_text(
+            (
+                data.get("responseData")
+                or {}
+            ).get("translatedText")
+        )
+
+        if translated:
+            with NEWS_TRANSLATION_CACHE_LOCK:
+                # Перечитываем свежую версию: другой поток мог
+                # добавить переводы, пока этот запрос был в сети.
+                cache = load_news_translation_cache()
+                cache[key] = translated
+
+                if len(cache) > 5000:
+                    cache = dict(
+                        list(cache.items())[-4000:]
+                    )
+
+                save_news_translation_cache(cache)
+
+            return translated
+
+    except Exception as error:
+        log_line(
+            "NEWS TRANSLATE — перевод недоступен:",
+            error
+        )
+
+    return value
+
+
+ISRAEL_NEWS_RSS_URL = "https://www.jpost.com/rss/rssfeedsisraelnews.aspx"
+ISRAEL_NEWS_INTERVAL = 60 * 60
+ISRAEL_NEWS_SEEN_FILE = state_file("israel_news_jpost_seen.json")
+ISRAEL_NEWS_FIRST_RUN = True
+
+
+def load_seen_israel_news():
+    if not os.path.exists(ISRAEL_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            ISRAEL_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        print(
+            "ИЗРАИЛЬ NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_israel_news(seen):
+    try:
+        with open(
+            ISRAEL_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-3000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        print(
+            "ИЗРАИЛЬ NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_israel_news():
+    response = requests.get(
+        ISRAEL_NEWS_RSS_URL,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64)"
+            ),
+            "Accept": (
+                "application/rss+xml,"
+                "application/xml,text/xml,*/*"
+            ),
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    root = ET.fromstring(
+        response.content
+    )
+
+    items = []
+    urls = set()
+
+    for item in root.findall(".//item"):
+        title = (
+            item.findtext("title")
+            or ""
+        ).strip()
+
+        description = clean_news_text(
+            item.findtext("description")
+            or ""
+        )
+
+        url = (
+            item.findtext("link")
+            or item.findtext("guid")
+            or ""
+        ).strip()
+
+        if (
+            not title
+            or not url.startswith("http")
+            or url in urls
+        ):
+            continue
+
+        urls.add(url)
+
+        items.append(
+            {
+                "title": title,
+                "description": description,
+                "url": url,
+            }
+        )
+
+    print(
+        "ИЗРАИЛЬ NEWS: найдено:",
+        len(items)
+    )
+
+    return items
+
+
+def make_israel_news_text(
+    title,
+    description,
+    url
+):
+    title_ru = translate_news_to_ru(title, "en")
+    description_ru = translate_news_to_ru(
+        description,
+        "en"
+    )
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(
+        str(url),
+        quote=True
+    )
+
+    parts = [
+        "🇮🇱 НОВОСТИ ИЗРАИЛЯ",
+        "",
+        safe_title,
+    ]
+
+    if (
+        safe_description
+        and safe_description.lower()
+        != safe_title.lower()
+    ):
+        parts += [
+            "",
+            safe_description,
+        ]
+
+    parts += [
+        "",
+        "Source: Jerusalem Post",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+def send_israel_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "ИЗРАИЛЬ NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    return result["result"]["message_id"]
+
+
+def check_israel_news():
+    global ISRAEL_NEWS_FIRST_RUN
+
+    items = fetch_israel_news()
+
+    if not items:
+        print(
+            "ИЗРАИЛЬ NEWS: публикаций не найдено"
+        )
+        return 0
+
+    seen = load_seen_israel_news()
+
+    if ISRAEL_NEWS_FIRST_RUN:
+        to_publish = items[:10]
+
+        print(
+            "ИЗРАИЛЬ NEWS: запуск сервера — "
+            f"публикую последние {len(to_publish)}"
+        )
+
+    else:
+        to_publish = [
+            item
+            for item in items
+            if item["url"] not in seen
+        ]
+
+        print(
+            "ИЗРАИЛЬ NEWS: новых публикаций:",
+            len(to_publish)
+        )
+
+    if not to_publish:
+        return 0
+
+    published = 0
+
+    # RSS обычно от новых к старым.
+    # В Telegram отправляем от старых к новым.
+    for index, item in enumerate(
+        reversed(to_publish),
+        start=1
+    ):
+        try:
+            send_israel_news_message(
+                make_israel_news_text(
+                    item["title"],
+                    item.get("description", ""),
+                    item["url"]
+                )
+            )
+
+            seen.add(
+                item["url"]
+            )
+
+            save_seen_israel_news(
+                seen
+            )
+
+            published += 1
+
+            print(
+                "ИЗРАИЛЬ NEWS: опубликовано",
+                f"{index}/{len(to_publish)}:",
+                item["url"]
+            )
+
+            if index < len(to_publish):
+                time.sleep(1.1)
+
+        except Exception as error:
+            print(
+                "ИЗРАИЛЬ NEWS — ОШИБКА СТАТЬИ:",
+                item["url"],
+                error
+            )
+
+    if ISRAEL_NEWS_FIRST_RUN:
+        # После стартовых 10 вся текущая RSS-лента
+        # считается просмотренной.
+        seen.update(
+            item["url"]
+            for item in items
+        )
+
+        save_seen_israel_news(
+            seen
+        )
+
+        ISRAEL_NEWS_FIRST_RUN = False
+
+    log_line(
+        "ИЗРАИЛЬ NEWS: опубликовано всего:",
+        published
+    )
+
+    return published
+
+
+def israel_news_scheduler_loop():
+    first_cycle = True
+
+    while True:
+        if not first_cycle:
+            now = datetime.now(TZ)
+
+            next_run = (
+                now.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
+                + timedelta(hours=1)
+            )
+
+            log_line(
+                "ИЗРАИЛЬ NEWS: следующее обновление",
+                next_run.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            time.sleep(
+                max(
+                    0,
+                    (next_run - now).total_seconds()
+                )
+            )
+
+        first_cycle = False
+
+        try:
+            log_line("ИЗРАИЛЬ NEWS: запуск проверки")
+            check_israel_news()
+            log_line("ИЗРАИЛЬ NEWS: проверка завершена")
+
+        except Exception as error:
+            log_line(
+                "ИЗРАИЛЬ NEWS — ОШИБКА:",
+                error
+            )
+
+
+# =========================================================
+# МИРОВЫЕ НОВОСТИ — GDELT DOC 2.0
+# =========================================================
+
+VOA_TOP_STORIES_URL = "https://www.voanews.com/"
+VOA_MIDDLE_EAST_RSS_URL = "https://www.voanews.com/api/zrbopl-vomx-tpeovm_"
+VOA_EUROPE_RSS_URL = "https://www.voanews.com/api/zjbovl-vomx-tpebvmr"
+VOA_UKRAINE_RSS_URL = "https://www.voanews.com/api/zt_rqyl-vomx-tpekboq_"
+VOA_USA_RSS_URL = "https://www.voanews.com/api/zqboml-vomx-tpeivmy"
+VOA_IRAN_RSS_URL = "https://www.voanews.com/api/zvgmqil-vomx-tpeumvqm"
+VOA_CHINA_RSS_URL = "https://www.voanews.com/api/zmjuqtl-vomx-tpey_jqq"
+
+CHINA_NEWS_SEEN_FILE = state_file(
+    "china_news_seen.json"
+)
+
+CHINA_NEWS_FIRST_RUN = True
+
+IRAN_NEWS_SEEN_FILE = state_file(
+    "iran_news_seen.json"
+)
+
+IRAN_NEWS_FIRST_RUN = True
+
+USA_NEWS_SEEN_FILE = state_file(
+    "usa_news_seen.json"
+)
+
+USA_NEWS_FIRST_RUN = True
+
+UKRAINE_NEWS_SEEN_FILE = state_file(
+    "ukraine_news_seen.json"
+)
+
+UKRAINE_NEWS_FIRST_RUN = True
+
+EUROPE_NEWS_SEEN_FILE = state_file(
+    "europe_news_seen.json"
+)
+
+EUROPE_NEWS_FIRST_RUN = True
+
+MIDDLE_EAST_NEWS_SEEN_FILE = state_file(
+    "middle_east_news_seen.json"
+)
+
+MIDDLE_EAST_NEWS_FIRST_RUN = True
+
+WORLD_NEWS_SEEN_FILE = state_file(
+    "world_news_seen.json"
+)
+
+WORLD_NEWS_FIRST_RUN = True
+
+
+
+class VOATopStoriesParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+
+        self.in_heading = False
+        self.heading_tag = ""
+        self.heading_parts = []
+
+        self.in_top_stories = False
+
+        self.in_link = False
+        self.link_href = ""
+        self.link_parts = []
+
+        self.items = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+
+        if tag in ("h1", "h2", "h3"):
+            self.in_heading = True
+            self.heading_tag = tag
+            self.heading_parts = []
+
+        if self.in_top_stories and tag == "a":
+            attrs_dict = dict(attrs)
+            href = str(
+                attrs_dict.get("href")
+                or ""
+            ).strip()
+
+            if href:
+                self.in_link = True
+                self.link_href = href
+                self.link_parts = []
+
+    def handle_data(self, data):
+        if self.in_heading:
+            self.heading_parts.append(data)
+
+        if self.in_link:
+            self.link_parts.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+
+        if (
+            self.in_heading
+            and tag == self.heading_tag
+        ):
+            heading = clean_news_text(
+                " ".join(self.heading_parts)
+            )
+
+            if heading.lower() == "top stories":
+                self.in_top_stories = True
+
+            elif self.in_top_stories:
+                # Следующий крупный раздел означает,
+                # что блок Top Stories закончился.
+                self.in_top_stories = False
+
+            self.in_heading = False
+            self.heading_tag = ""
+            self.heading_parts = []
+
+        if self.in_link and tag == "a":
+            title = clean_news_text(
+                " ".join(self.link_parts)
+            )
+
+            href = self.link_href
+
+            if title and href:
+                self.items.append(
+                    {
+                        "title": title,
+                        "url": urljoin(
+                            VOA_TOP_STORIES_URL,
+                            href
+                        ),
+                    }
+                )
+
+            self.in_link = False
+            self.link_href = ""
+            self.link_parts = []
+
+
+def load_seen_world_news():
+    if not os.path.exists(WORLD_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            WORLD_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "WORLD NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_world_news(seen):
+    try:
+        with open(
+            WORLD_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "WORLD NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_world_news():
+    response = requests.get(
+        VOA_TOP_STORIES_URL,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/142.0 Safari/537.36"
+            ),
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,*/*;q=0.8"
+            ),
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    parser = VOATopStoriesParser()
+    parser.feed(response.text)
+
+    items = []
+    seen_urls = set()
+    seen_titles = set()
+
+    for item in parser.items:
+        title = clean_news_text(
+            item.get("title")
+        )
+
+        url = str(
+            item.get("url")
+            or ""
+        ).strip()
+
+        if (
+            not title
+            or not url.startswith(
+                "https://www.voanews.com/"
+            )
+        ):
+            continue
+
+        # Отбрасываем навигационные ссылки.
+        if title.lower() in {
+            "top stories",
+            "more",
+            "more from voa",
+            "breaking news",
+        }:
+            continue
+
+        normalized_title = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            title.lower()
+        ).strip()
+
+        if (
+            url in seen_urls
+            or (
+                normalized_title
+                and normalized_title in seen_titles
+            )
+        ):
+            continue
+
+        seen_urls.add(url)
+
+        if normalized_title:
+            seen_titles.add(
+                normalized_title
+            )
+
+        items.append(
+            {
+                "title": title,
+                "url": url,
+                "domain": "Voice of America",
+            }
+        )
+
+    log_line(
+        "WORLD NEWS / VOA TOP STORIES: найдено:",
+        len(items)
+    )
+
+    if not items:
+        raise RuntimeError(
+            "VOA Top Stories не найдены "
+            "на главной странице"
+        )
+
+    return items
+
+def make_world_news_text(item):
+    title_ru = translate_news_to_ru(
+        item.get("title", ""),
+        "en"
+    )
+
+    safe_title = html.escape(title_ru)
+
+    safe_url = html.escape(
+        item.get("url", ""),
+        quote=True
+    )
+
+    return (
+        "🌍 МИРОВЫЕ НОВОСТИ\n\n"
+        f"{safe_title}\n\n"
+        "Source: Voice of America\n"
+        f'<a href="{safe_url}">Оригинал</a>\n\n'
+        "@ne_zaika"
+    )
+
+def send_world_news_message(text):
+    safe_text, truncated = _truncate_telegram_text(text)
+
+    log_line(
+        "WORLD NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    return result["result"]["message_id"]
+
+
+def check_world_news():
+    global WORLD_NEWS_FIRST_RUN
+
+    items = fetch_world_news()
+
+    if not items:
+        log_line(
+            "WORLD NEWS: публикаций не найдено"
+        )
+        return 0
+
+    seen = load_seen_world_news()
+
+    if WORLD_NEWS_FIRST_RUN:
+        to_publish = items[:10]
+
+        log_line(
+            "WORLD NEWS: запуск сервера — "
+            f"публикую последние {len(to_publish)}"
+        )
+
+    else:
+        to_publish = [
+            item
+            for item in items
+            if item["url"] not in seen
+        ]
+
+        log_line(
+            "WORLD NEWS: новых публикаций:",
+            len(to_publish)
+        )
+
+    if not to_publish:
+        return 0
+
+    published = 0
+
+    for index, item in enumerate(
+        reversed(to_publish),
+        start=1
+    ):
+        try:
+            send_world_news_message(
+                make_world_news_text(item)
+            )
+
+            seen.add(item["url"])
+            save_seen_world_news(seen)
+            published += 1
+
+            log_line(
+                "WORLD NEWS: опубликовано",
+                f"{index}/{len(to_publish)}:",
+                item["url"]
+            )
+
+            if index < len(to_publish):
+                time.sleep(1.1)
+
+        except Exception as error:
+            log_line(
+                "WORLD NEWS — ОШИБКА СТАТЬИ:",
+                item.get("url", ""),
+                error
+            )
+
+    if WORLD_NEWS_FIRST_RUN:
+        seen.update(
+            item["url"]
+            for item in items
+        )
+
+        save_seen_world_news(seen)
+        WORLD_NEWS_FIRST_RUN = False
+
+    log_line(
+        "WORLD NEWS: опубликовано всего:",
+        published
+    )
+
+    return published
+
+
+
+def load_seen_middle_east_news():
+    if not os.path.exists(MIDDLE_EAST_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            MIDDLE_EAST_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "БЛИЖНИЙ ВОСТОК NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_middle_east_news(seen):
+    try:
+        with open(
+            MIDDLE_EAST_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "БЛИЖНИЙ ВОСТОК NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_middle_east_news():
+    response = requests.get(
+        VOA_MIDDLE_EAST_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("БЛИЖНИЙ ВОСТОК / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA Middle East RSS не вернул новости")
+
+    return items
+
+
+def make_middle_east_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 БЛИЖНИЙ ВОСТОК", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_middle_east_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_middle_east_news():
+    global MIDDLE_EAST_NEWS_FIRST_RUN
+
+    log_line("БЛИЖНИЙ ВОСТОК NEWS: запуск проверки")
+
+    try:
+        items = fetch_middle_east_news()
+        seen = load_seen_middle_east_news()
+
+        if MIDDLE_EAST_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("БЛИЖНИЙ ВОСТОК NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_middle_east_news_text(item)
+
+            print(
+                "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_middle_east_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"БЛИЖНИЙ ВОСТОК NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_middle_east_news(seen)
+
+        log_line(
+            "БЛИЖНИЙ ВОСТОК NEWS: опубликовано всего:",
+            published
+        )
+        log_line("БЛИЖНИЙ ВОСТОК NEWS: проверка завершена")
+
+        MIDDLE_EAST_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("БЛИЖНИЙ ВОСТОК NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def middle_east_news_scheduler_loop():
+    check_middle_east_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "БЛИЖНИЙ ВОСТОК NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_middle_east_news()
+
+
+def load_seen_europe_news():
+    if not os.path.exists(EUROPE_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            EUROPE_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "ЕВРОПА NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_europe_news(seen):
+    try:
+        with open(
+            EUROPE_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "ЕВРОПА NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_europe_news():
+    response = requests.get(
+        VOA_EUROPE_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("ЕВРОПА / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA Europe RSS не вернул новости")
+
+    return items
+
+
+def make_europe_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 ЕВРОПА", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_europe_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "ЕВРОПА NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "ЕВРОПА NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_europe_news():
+    global EUROPE_NEWS_FIRST_RUN
+
+    log_line("ЕВРОПА NEWS: запуск проверки")
+
+    try:
+        items = fetch_europe_news()
+        seen = load_seen_europe_news()
+
+        if EUROPE_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("ЕВРОПА NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_europe_news_text(item)
+
+            print(
+                "ЕВРОПА NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_europe_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"ЕВРОПА NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_europe_news(seen)
+
+        log_line(
+            "ЕВРОПА NEWS: опубликовано всего:",
+            published
+        )
+        log_line("ЕВРОПА NEWS: проверка завершена")
+
+        EUROPE_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("ЕВРОПА NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def europe_news_scheduler_loop():
+    check_europe_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "ЕВРОПА NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_europe_news()
+
+
+def load_seen_ukraine_news():
+    if not os.path.exists(UKRAINE_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            UKRAINE_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "УКРАИНА NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_ukraine_news(seen):
+    try:
+        with open(
+            UKRAINE_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "УКРАИНА NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_ukraine_news():
+    response = requests.get(
+        VOA_UKRAINE_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("УКРАИНА / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA Ukraine RSS не вернул новости")
+
+    return items
+
+
+def make_ukraine_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 УКРАИНА", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_ukraine_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "УКРАИНА NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "УКРАИНА NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_ukraine_news():
+    global UKRAINE_NEWS_FIRST_RUN
+
+    log_line("УКРАИНА NEWS: запуск проверки")
+
+    try:
+        items = fetch_ukraine_news()
+        seen = load_seen_ukraine_news()
+
+        if UKRAINE_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("УКРАИНА NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_ukraine_news_text(item)
+
+            print(
+                "УКРАИНА NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_ukraine_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"УКРАИНА NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_ukraine_news(seen)
+
+        log_line(
+            "УКРАИНА NEWS: опубликовано всего:",
+            published
+        )
+        log_line("УКРАИНА NEWS: проверка завершена")
+
+        UKRAINE_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("УКРАИНА NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def ukraine_news_scheduler_loop():
+    check_ukraine_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "УКРАИНА NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_ukraine_news()
+
+
+def load_seen_usa_news():
+    if not os.path.exists(USA_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            USA_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "США NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_usa_news(seen):
+    try:
+        with open(
+            USA_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "США NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_usa_news():
+    response = requests.get(
+        VOA_USA_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("США / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA USA RSS не вернул новости")
+
+    return items
+
+
+def make_usa_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 США", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_usa_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "США NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "США NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_usa_news():
+    global USA_NEWS_FIRST_RUN
+
+    log_line("США NEWS: запуск проверки")
+
+    try:
+        items = fetch_usa_news()
+        seen = load_seen_usa_news()
+
+        if USA_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("США NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_usa_news_text(item)
+
+            print(
+                "США NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_usa_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"США NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_usa_news(seen)
+
+        log_line(
+            "США NEWS: опубликовано всего:",
+            published
+        )
+        log_line("США NEWS: проверка завершена")
+
+        USA_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("США NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def usa_news_scheduler_loop():
+    check_usa_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "США NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_usa_news()
+
+
+def load_seen_iran_news():
+    if not os.path.exists(IRAN_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            IRAN_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "ИРАН NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_iran_news(seen):
+    try:
+        with open(
+            IRAN_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "ИРАН NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_iran_news():
+    response = requests.get(
+        VOA_IRAN_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("ИРАН / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA Iran RSS не вернул новости")
+
+    return items
+
+
+def make_iran_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 ИРАН", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_iran_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "ИРАН NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "ИРАН NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_iran_news():
+    global IRAN_NEWS_FIRST_RUN
+
+    log_line("ИРАН NEWS: запуск проверки")
+
+    try:
+        items = fetch_iran_news()
+        seen = load_seen_iran_news()
+
+        if IRAN_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("ИРАН NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_iran_news_text(item)
+
+            print(
+                "ИРАН NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_iran_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"ИРАН NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_iran_news(seen)
+
+        log_line(
+            "ИРАН NEWS: опубликовано всего:",
+            published
+        )
+        log_line("ИРАН NEWS: проверка завершена")
+
+        IRAN_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("ИРАН NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def iran_news_scheduler_loop():
+    check_iran_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "ИРАН NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_iran_news()
+
+
+def world_news_scheduler_loop():
+    first_cycle = True
+
+    while True:
+        if not first_cycle:
+            now = datetime.now(TZ)
+
+            next_run = (
+                now.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
+                + timedelta(hours=1)
+            )
+
+            log_line(
+                "WORLD NEWS: следующее обновление",
+                next_run.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            time.sleep(
+                max(
+                    0,
+                    (next_run - now).total_seconds()
+                )
+            )
+
+        first_cycle = False
+
+        try:
+            log_line("WORLD NEWS: запуск проверки")
+            check_world_news()
+            log_line("WORLD NEWS: проверка завершена")
+
+        except Exception as error:
+            log_line(
+                "WORLD NEWS — ОШИБКА:",
+                error
+            )
+
 
 def send_private_reply(chat_id, text):
-    response = requests.post(
-        (
-            f"https://api.telegram.org/"
-            f"bot{BOT_TOKEN}/sendMessage"
-        ),
+    response = _telegram_send_post(
         data={
             "chat_id": chat_id,
             "text": text,
         },
-        timeout=10
+        timeout=10,
     )
 
     response.raise_for_status()
@@ -3365,6 +6321,95 @@ def check_telegram_commands(offset=None):
                     "Табло Бен-Гуриона обновлено."
                 )
 
+            elif command == "/news":
+                published = check_haifa_news()
+                send_private_reply(
+                    chat_id,
+                    f"Новости Хайфы проверены. Опубликовано новых: {published}."
+                )
+
+            elif command == "/middleeast":
+                published = check_middle_east_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Ближнего Востока проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/europe":
+                published = check_europe_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Европы проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/ukraine":
+                published = check_ukraine_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Украины проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/usa":
+                published = check_usa_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости США проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/iran":
+                published = check_iran_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Ирана проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/china":
+                published = check_china_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Китая проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/worldnews":
+                published = check_world_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Мировые новости проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
+            elif command == "/israelnews":
+                published = check_israel_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Израиля проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
             elif command == "/rates":
                 rates_message_id = update_rates()
                 send_private_reply(
@@ -3443,6 +6488,683 @@ def next_flights_run(now=None):
     return target
 
 
+
+# =========================================================
+def load_seen_china_news():
+    if not os.path.exists(CHINA_NEWS_SEEN_FILE):
+        return set()
+
+    try:
+        with open(
+            CHINA_NEWS_SEEN_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return set(data)
+
+    except Exception as error:
+        log_line(
+            "КИТАЙ NEWS — ошибка state:",
+            error
+        )
+
+    return set()
+
+
+def save_seen_china_news(seen):
+    try:
+        with open(
+            CHINA_NEWS_SEEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as file:
+            json.dump(
+                list(seen)[-5000:],
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    except Exception as error:
+        log_line(
+            "КИТАЙ NEWS — ошибка записи state:",
+            error
+        )
+
+
+def fetch_china_news():
+    response = requests.get(
+        VOA_CHINA_RSS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.findall(".//item"):
+        title = clean_news_text(node.findtext("title") or "")
+        url = str(node.findtext("link") or "").strip()
+        description = clean_news_text(node.findtext("description") or "")
+
+        if title and url:
+            items.append({
+                "title": title,
+                "url": url,
+                "description": description,
+            })
+
+    log_line("КИТАЙ / VOA: найдено:", len(items))
+
+    if not items:
+        raise RuntimeError("VOA China RSS не вернул новости")
+
+    return items
+
+
+def make_china_news_text(item):
+    title_ru = translate_news_to_ru(item.get("title", ""), "en")
+    description_ru = translate_news_to_ru(item.get("description", ""), "en")
+
+    safe_title = html.escape(title_ru)
+    safe_description = html.escape(description_ru)
+    safe_url = html.escape(item.get("url", ""), quote=True)
+
+    parts = ["🌍 КИТАЙ", "", safe_title]
+
+    if safe_description:
+        parts += ["", safe_description]
+
+    parts += [
+        "",
+        "Source: Voice of America",
+        f'<a href="{safe_url}">Оригинал</a>',
+        "",
+        "@ne_zaika",
+    ]
+
+    return "\n".join(parts)
+
+
+
+def send_china_news_message(text):
+    safe_text, truncated = (
+        _truncate_telegram_text(
+            text
+        )
+    )
+
+    print(
+        "КИТАЙ NEWS TELEGRAM:",
+        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
+        "(ОБРЕЗАНО)" if truncated else ""
+    )
+
+    response = _telegram_send_post(
+        data={
+            "chat_id": CHANNEL,
+            "text": safe_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result)
+
+    message_id = result["result"]["message_id"]
+
+    print(
+        "КИТАЙ NEWS TELEGRAM: OK",
+        f"message_id={message_id}"
+    )
+
+    return message_id
+
+
+def check_china_news():
+    global CHINA_NEWS_FIRST_RUN
+
+    log_line("КИТАЙ NEWS: запуск проверки")
+
+    try:
+        items = fetch_china_news()
+        seen = load_seen_china_news()
+
+        if CHINA_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            print("КИТАЙ NEWS: запуск сервера — публикую последние 10")
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(reversed(to_publish), start=1):
+            message = make_china_news_text(item)
+
+            print(
+                "КИТАЙ NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            send_china_news_message(
+                message
+            )
+
+            published += 1
+            print(
+                f"КИТАЙ NEWS: опубликовано "
+                f"{index}/{len(to_publish)}: {item.get('url', '')}"
+            )
+
+        for item in items:
+            url = item.get("url")
+            if url:
+                seen.add(url)
+
+        save_seen_china_news(seen)
+
+        log_line(
+            "КИТАЙ NEWS: опубликовано всего:",
+            published
+        )
+        log_line("КИТАЙ NEWS: проверка завершена")
+
+        CHINA_NEWS_FIRST_RUN = False
+        return published
+
+    except Exception as exc:
+        log_line("КИТАЙ NEWS — ОШИБКА:", exc)
+        return 0
+
+
+def china_news_scheduler_loop():
+    check_china_news()
+
+    while True:
+        now = datetime.now()
+        next_run = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+        log_line(
+            "КИТАЙ NEWS: следующее обновление",
+            next_run.strftime("%d.%m.%Y %H:%M:%S")
+        )
+
+        seconds = max(
+            1,
+            (next_run - datetime.now()).total_seconds()
+        )
+        time.sleep(seconds)
+
+        check_china_news()
+
+
+def world_news_scheduler_loop():
+    first_cycle = True
+
+    while True:
+        if not first_cycle:
+            now = datetime.now(TZ)
+
+            next_run = (
+                now.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0
+                )
+                + timedelta(hours=1)
+            )
+
+            log_line(
+                "WORLD NEWS: следующее обновление",
+                next_run.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            time.sleep(
+                max(
+                    0,
+                    (next_run - now).total_seconds()
+                )
+            )
+
+        first_cycle = False
+
+        try:
+            log_line("WORLD NEWS: запуск проверки")
+            check_world_news()
+            log_line("WORLD NEWS: проверка завершена")
+
+        except Exception as error:
+            log_line(
+                "WORLD NEWS — ОШИБКА:",
+                error
+            )
+
+
+def send_private_reply(chat_id, text):
+    response = _telegram_send_post(
+        data={
+            "chat_id": chat_id,
+            "text": text,
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+
+def check_telegram_commands(offset=None):
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/getUpdates"
+    )
+
+    params = {
+        "timeout": 0,
+        "limit": 20
+    }
+
+    if offset is not None:
+        params["offset"] = offset
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=10
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("ok"):
+        return offset
+
+    for update in data.get("result", []):
+        offset = update["update_id"] + 1
+
+        message = update.get("message")
+
+        if not message:
+            continue
+
+        command = (
+            message.get("text", "")
+            .strip()
+            .lower()
+            .split()[0]
+            if message.get("text")
+            else ""
+        )
+
+        chat_id = message["chat"]["id"]
+
+        try:
+            if command == "/weather":
+                weather_message_id = update_weather()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Погода реально обновлена. "
+                        f"Пост #{weather_message_id}. "
+                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
+                    )
+                )
+
+            elif command == "/arrivals":
+                flights = get_flights()
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "A",
+                        "actual"
+                    )
+                )
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "A",
+                        "next"
+                    )
+                )
+
+                send_private_reply(
+                    chat_id,
+                    "Созданы 2 новых поста прилётов."
+                )
+
+            elif command == "/departures":
+                flights = get_flights()
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "D",
+                        "actual"
+                    )
+                )
+
+                send_message(
+                    make_flights_text(
+                        flights,
+                        "D",
+                        "next"
+                    )
+                )
+
+                send_private_reply(
+                    chat_id,
+                    "Созданы 2 новых поста вылетов."
+                )
+
+            elif command == "/time":
+                update_time_post()
+
+                send_private_reply(
+                    chat_id,
+                    "Создан новый пост мирового времени."
+                )
+
+            elif command == "/flights":
+                update_flight_board()
+                send_private_reply(
+                    chat_id,
+                    "Табло Бен-Гуриона обновлено."
+                )
+
+            elif command == "/news":
+                published = check_haifa_news()
+                send_private_reply(
+                    chat_id,
+                    f"Новости Хайфы проверены. Опубликовано новых: {published}."
+                )
+
+            elif command == "/middleeast":
+                published = check_middle_east_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Ближнего Востока проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/europe":
+                published = check_europe_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Европы проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/ukraine":
+                published = check_ukraine_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Украины проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/usa":
+                published = check_usa_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости США проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/iran":
+                published = check_china_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Ирана проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+            elif command == "/worldnews":
+                published = check_world_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Мировые новости проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
+            elif command == "/israelnews":
+                published = check_israel_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Новости Израиля проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
+            elif command == "/rates":
+                rates_message_id = update_rates()
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Курсы обновлены. "
+                        f"Пост #{rates_message_id}. "
+                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
+                    )
+                )
+
+        except Exception as error:
+            print(
+                "ОШИБКА TELEGRAM-КОМАНДЫ:",
+                command,
+                error
+            )
+
+            try:
+                send_private_reply(
+                    chat_id,
+                    f"Ошибка выполнения {command}"
+                )
+            except Exception:
+                pass
+
+    return offset
+
+
+# =========================================================
+# 4. ПЛАНИРОВЩИК
+# =========================================================
+# Оба сервиса независимы.
+#
+# Погода:
+#   проверяется раз в минуту;
+#   автоматически обновляется при смене часа.
+#
+# Бен-Гурион:
+#   НЕ проверяется минутным циклом;
+#   отдельный таймер запускает обновление только в :00 и :30.
+#
+# Ошибка одного сервиса НЕ останавливает второй.
+# =========================================================
+
+def weather_schedule_key(now):
+    return now.strftime(
+        "%Y-%m-%d %H"
+    )
+
+
+def next_flights_run(now=None):
+    """
+    Следующий запуск табло Бен-Гуриона:
+    строго ближайшие :00 или :30.
+    """
+    if now is None:
+        now = datetime.now(TZ)
+
+    if now.minute < 30:
+        target = now.replace(
+            minute=30,
+            second=0,
+            microsecond=0
+        )
+    else:
+        target = (
+            now.replace(
+                minute=0,
+                second=0,
+                microsecond=0
+            )
+            + timedelta(hours=1)
+        )
+
+    return target
+
+
+
+# =========================================================
+# ЕДИНЫЙ ДИСПЕТЧЕР НОВОСТЕЙ
+# =========================================================
+# При запуске сервера выполняет стартовую проверку всех веток последовательно.
+# Далее запускает полный цикл новостей строго в начале каждого часа (:00).
+# Это исключает рассинхронизацию отдельных новостных потоков и гонку отправок.
+# =========================================================
+
+NEWS_DISPATCH_LOCK = threading.Lock()
+
+
+def next_full_hour(now=None):
+    if now is None:
+        now = datetime.now(TZ)
+    return (
+        now.replace(
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+        + timedelta(hours=1)
+    )
+
+
+def log_next_news_update(now=None):
+    next_run = next_full_hour(now)
+    log_line(
+        "NEWS DISPATCHER: следующее обновление",
+        next_run.strftime("%d.%m.%Y %H:%M:%S")
+    )
+    return next_run
+
+
+def news_schedule_key(now):
+    """
+    Ключ текущего часа.
+    При переходе, например, 15:59 -> 16:00 значение меняется,
+    и главный диспетчер запускает проверку новостей.
+    """
+    return (
+        now.year,
+        now.month,
+        now.day,
+        now.hour,
+    )
+
+
+def start_news_dispatch(reason="по расписанию"):
+    """
+    Запускает полный цикл новостей в отдельном потоке.
+    Если предыдущий цикл ещё идёт, второй одновременно не запускается.
+    """
+    if NEWS_DISPATCH_LOCK.locked():
+        log_line(
+            f"NEWS DISPATCHER: пропуск запуска ({reason}) — предыдущий цикл ещё выполняется"
+        )
+        return False
+
+    def worker():
+        with NEWS_DISPATCH_LOCK:
+            try:
+                log_line(f"NEWS DISPATCHER: запуск ({reason})")
+                run_all_news_checks()
+                log_line(f"NEWS DISPATCHER: завершён ({reason})")
+            except Exception as exc:
+                log_line(f"NEWS DISPATCHER: ОШИБКА ({reason}):", exc)
+            finally:
+                log_next_news_update()
+
+    thread = threading.Thread(
+        target=worker,
+        daemon=True,
+        name="news-dispatch-worker"
+    )
+    thread.start()
+    return True
+
+
+def run_all_news_checks():
+    sections = [
+        ("ХАЙФА", check_haifa_news),
+        ("ИЗРАИЛЬ", check_israel_news),
+        ("WORLD", check_world_news),
+        ("БЛИЖНИЙ ВОСТОК", check_middle_east_news),
+        ("ЕВРОПА", check_europe_news),
+        ("УКРАИНА", check_ukraine_news),
+        ("США", check_usa_news),
+        ("ИРАН", check_iran_news),
+        ("КИТАЙ", check_china_news),
+    ]
+
+    for section_name, checker in sections:
+        try:
+            log_line(f"NEWS DISPATCHER: {section_name} — запуск проверки")
+            checker()
+            log_line(f"NEWS DISPATCHER: {section_name} — проверка завершена")
+        except Exception as exc:
+            log_line(f"NEWS DISPATCHER: {section_name} — ОШИБКА:", exc)
+
+
+def all_news_scheduler_loop():
+    """
+    Оставлено для совместимости.
+    Реальное часовое расписание новостей теперь контролирует main().
+    """
+    start_news_dispatch("старт сервера")
+    log_next_news_update(now)
+    while True:
+        time.sleep(3600)
+
+
 def flights_scheduler_loop():
     """
     Рейсы НЕ участвуют в минутном polling.
@@ -3451,7 +7173,7 @@ def flights_scheduler_loop():
       1) вычисляет ближайшие :00 / :30;
       2) спит до этого момента;
       3) обновляет 5 постов;
-      4) снова вычисляет следующий запуск.
+      4) снова вычисляет следующее обновление.
     """
     while True:
         now = datetime.now(TZ)
@@ -3462,15 +7184,17 @@ def flights_scheduler_loop():
             (target - now).total_seconds()
         )
 
-        print(
+        log_line(
             "БЕН-ГУРИОН: следующее обновление",
-            target.strftime("%d.%m %H:%M")
+            target.strftime("%d.%m.%Y %H:%M:%S")
         )
 
         time.sleep(seconds)
 
         try:
+            log_line("БЕН-ГУРИОН: запуск обновления")
             update_flight_board()
+            log_line("БЕН-ГУРИОН: обновление завершено")
         except Exception as error:
             print(
                 "БЕН-ГУРИОН — ОШИБКА:",
@@ -3501,7 +7225,7 @@ def time_schedule_key(now):
 def main():
     telegram_offset = None
 
-    print(
+    log_line(
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
 
@@ -3528,6 +7252,11 @@ def main():
         name="ben-gurion-scheduler"
     )
     flights_thread.start()
+
+
+    # Новости запускаются главным диспетчером.
+    # Стартовая проверка выполняется сразу.
+    start_news_dispatch("старт сервера")
 
     try:
         update_rates()
@@ -3559,7 +7288,11 @@ def main():
         time_schedule_key(now)
     )
 
-    print(
+    last_news_key = (
+        news_schedule_key(now)
+    )
+
+    log_line(
         "ДИСПЕТЧЕР ЗАПУЩЕН."
     )
     print(
@@ -3567,6 +7300,12 @@ def main():
     )
     print(
         "Бен-Гурион: 5 новых постов в :00 и :30."
+    )
+    print(
+        "Новости Хайфы: проверка раз в час."
+    )
+    print(
+        "Новости: главный диспетчер; старт сразу, затем проверка при каждом переходе на новый час (:00)."
     )
     print(
         "Валюты: новый пост в 08:00, 12:00, 16:00, 20:00."
@@ -3647,6 +7386,31 @@ def main():
                 )
 
         # ---------------------------------------------
+        # НОВОСТИ — ПРОВЕРКА КАЖДЫЙ НОВЫЙ ЧАС
+        # Главный диспетчер, без отдельного часового sleep-потока.
+        # ---------------------------------------------
+        current_news_key = (
+            news_schedule_key(now)
+        )
+
+        if (
+            current_news_key
+            != last_news_key
+        ):
+            log_line(
+                "NEWS DISPATCHER: ЧАСОВОЙ ТРИГГЕР",
+                now.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            if start_news_dispatch(
+                "автообновление :00"
+            ):
+                last_news_key = (
+                    current_news_key
+                )
+                log_next_news_update(now)
+
+        # ---------------------------------------------
         # TELEGRAM-КОМАНДЫ
         # ---------------------------------------------
         try:
@@ -3689,6 +7453,12 @@ if __name__ == "__main__":
         and sys.argv[1].lower() == "rates"
     ):
         update_rates()
+
+    elif (
+        len(sys.argv) > 1
+        and sys.argv[1].lower() == "news"
+    ):
+        check_haifa_news()
 
     else:
         main()
