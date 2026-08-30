@@ -1,6 +1,6 @@
 # =========================================================
-# ОТМЕНА ПРОСТЫНЕЙ: сервисный навигатор закреплён сверху канала
-# | 3.8.2
+# СМЕНА ИМЕНИ: проверка уровня доступа бота
+# | 3.8.5
 # =========================================================
 
 
@@ -610,6 +610,76 @@ def pin_services_post(message_id):
     return False
 
 
+def debug_bot_rights():
+    print("BOT RIGHTS CHECK: START")
+    """
+    Показывает, какие права Telegram реально видит у бота в канале.
+    """
+    try:
+        me_url = (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/getMe"
+        )
+
+        me_response = requests.get(
+            me_url,
+            timeout=20,
+        )
+        me_data = me_response.json()
+
+        if not me_data.get("ok"):
+            log_line(
+                "TELEGRAM BOT RIGHTS: getMe ошибка:",
+                me_response.text[:300]
+            )
+            return False
+
+        bot_id = me_data["result"]["id"]
+
+        member_url = (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/getChatMember"
+        )
+
+        member_response = requests.get(
+            member_url,
+            params={
+                "chat_id": CHANNEL,
+                "user_id": bot_id,
+            },
+            timeout=20,
+        )
+        member_data = member_response.json()
+
+        if not member_data.get("ok"):
+            log_line(
+                "TELEGRAM BOT RIGHTS: getChatMember ошибка:",
+                member_response.text[:300]
+            )
+            return False
+
+        result = member_data["result"]
+
+        log_line(
+            "TELEGRAM BOT RIGHTS:",
+            f"status={result.get('status')}",
+            f"can_post_messages={result.get('can_post_messages')}",
+            f"can_edit_messages={result.get('can_edit_messages')}",
+            f"can_delete_messages={result.get('can_delete_messages')}",
+            f"can_manage_chat={result.get('can_manage_chat')}",
+            f"can_pin_messages={result.get('can_pin_messages')}",
+        )
+
+        return True
+
+    except Exception as exc:
+        log_line(
+            "TELEGRAM BOT RIGHTS: ошибка проверки:",
+            exc
+        )
+        return False
+
+
 def update_services_post():
     """
     Создаёт навигатор один раз, затем только редактирует его.
@@ -701,7 +771,7 @@ def safe_update_services_post():
 #
 # Принудительное обновление:
 #   Telegram: /weather
-#   CMD:      python weather_bot.py now
+#   CMD:      python ne_zaika_bot.py now
 # =========================================================
 
 # Хайфа
@@ -8651,10 +8721,14 @@ def time_schedule_key(now):
 def main():
     telegram_offset = None
 
+    print(f"RUNNING FILE: {Path(__file__).resolve()}")
+
     log_line(
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
 
+
+    debug_bot_rights()
     # При запуске обновляем постоянные сервисные посты; новых простыней не создаём.
     try:
         update_weather()
@@ -8860,31 +8934,53 @@ def main():
 # 5. ЗАПУСК И ПРИНУДИТЕЛЬНЫЕ КОМАНДЫ ИЗ CMD
 # =========================================================
 
+def print_restart_command(reason="СЕРВЕР ОСТАНОВЛЕН"):
+    print()
+    print("=" * 60)
+    print(reason)
+    print()
+    print("ПОВТОРНЫЙ ЗАПУСК:")
+    print(f"python {Path(__file__).name}")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
 
-    if (
-        len(sys.argv) > 1
-        and sys.argv[1].lower() == "now"
-    ):
-        update_weather()
+    try:
+        if (
+            len(sys.argv) > 1
+            and sys.argv[1].lower() == "now"
+        ):
+            update_weather()
 
-    elif (
-        len(sys.argv) > 1
-        and sys.argv[1].lower() == "flights"
-    ):
-        update_flight_board()
+        elif (
+            len(sys.argv) > 1
+            and sys.argv[1].lower() == "flights"
+        ):
+            update_flight_board()
 
-    elif (
-        len(sys.argv) > 1
-        and sys.argv[1].lower() == "rates"
-    ):
-        update_rates()
+        elif (
+            len(sys.argv) > 1
+            and sys.argv[1].lower() == "rates"
+        ):
+            update_rates()
 
-    elif (
-        len(sys.argv) > 1
-        and sys.argv[1].lower() == "news"
-    ):
-        check_haifa_news()
+        elif (
+            len(sys.argv) > 1
+            and sys.argv[1].lower() == "news"
+        ):
+            check_haifa_news()
+
+        else:
+            main()
+
+    except KeyboardInterrupt:
+        print_restart_command("СЕРВЕР ОСТАНОВЛЕН: Ctrl+C")
+
+    except Exception as error:
+        print()
+        print("КРИТИЧЕСКАЯ ОШИБКА:", repr(error))
+        print_restart_command("СЕРВЕР ОСТАНОВЛЕН ИЗ-ЗА ОШИБКИ")
 
     else:
-        main()
+        print_restart_command("СЕРВЕР ЗАВЕРШИЛ РАБОТУ")
