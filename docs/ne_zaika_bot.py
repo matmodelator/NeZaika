@@ -1,6 +1,6 @@
 # =========================================================
-# КОНТЕНТ-ПАКЕТ В НАЧАЛЕ КАЖДОЙ ВЫДАЧИ, ДАЖЕ БЕЗ НОВОСТЕЙ; СТОРИ: UTF-8 / BOM / CP1251
-# | 3.8.10
+# КОНТЕНТ-ПАКЕТ ПРИ КАЖДОМ ОБНОВЛЕНИИ; MM.DD; nezaika FALLBACK НА МИНИМАЛЬНЫЙ НОМЕР
+# | 3.8.13
 # =========================================================
 
 
@@ -418,19 +418,127 @@ def update_persistent_post(text, filename):
 
 # =========================================================
 # 0.3. СЕРВИСЫ — ПОСТ-НАВИГАТОР
-# | 3.8.0
+# | 3.8.11
 # =========================================================
-# Один постоянный ФОТО-пост со ссылками на последние сервисные
-# сообщения. После обновления погоды / рейсов / валют /
-# мирового времени навигатор редактируется автоматически.
+# Картинка закреплённого сервисного поста берётся из
+# C:\ne_zaika_bot\nezaika\MM.DD.* по текущей дате Израиля.
+# При смене даты создаётся новый сервисный фото-пост,
+# старый открепляется, новый закрепляется.
 # =========================================================
 
 SERVICES_MESSAGE_ID_FILE = state_file("services_message_id.txt")
+SERVICES_PACK_NUMBER_FILE = state_file("services_pack_number.txt")
 TIME_MESSAGE_ID_FILE = state_file("time_message_id.txt")
 
-# Картинка закреплённого сервисного поста.
-# Файл services_banner.png должен лежать рядом с ne_zaika_bot.py.
-SERVICES_BANNER_FILE = Path(__file__).resolve().parent / "services_banner.png"
+SERVICES_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp"
+}
+
+
+def current_content_pack_number():
+    """Текущий номер контент-пакета: MM.DD по времени Израиля."""
+    return datetime.now(TZ).strftime("%m.%d")
+
+
+def _find_dated_file(folder, pack_number, allowed_extensions):
+    """Ищет MM.DD.* с допустимым расширением."""
+    folder = Path(folder)
+
+    if not folder.exists():
+        return None
+
+    for path in sorted(folder.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in allowed_extensions:
+            continue
+        if path.stem == pack_number:
+            return path
+
+    return None
+
+
+def _find_min_numbered_file(folder, allowed_extensions):
+    """
+    Ищет файл с минимальным номером MM.DD среди допустимых расширений.
+    Например: 01.01.* < 03.15.* < 08.30.*.
+    """
+    folder = Path(folder)
+
+    if not folder.exists():
+        return None
+
+    candidates = []
+
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in allowed_extensions:
+            continue
+
+        match = re.fullmatch(r"(\d{2})\.(\d{2})", path.stem)
+        if not match:
+            continue
+
+        month = int(match.group(1))
+        day = int(match.group(2))
+
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            continue
+
+        candidates.append(((month, day), path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0][0], item[0][1], item[1].name.lower()))
+    return candidates[0][1]
+
+
+def current_services_image():
+    current_number = current_content_pack_number()
+    nezaika_dir = Path(BASE_DIR) / "nezaika"
+
+    image_path = _find_dated_file(
+        nezaika_dir,
+        current_number,
+        SERVICES_IMAGE_EXTENSIONS,
+    )
+
+    if image_path is None:
+        image_path = _find_min_numbered_file(
+            nezaika_dir,
+            SERVICES_IMAGE_EXTENSIONS,
+        )
+
+        if image_path is not None:
+            log_line(
+                "СЕРВИСЫ: картинки текущей даты нет — "
+                "использую минимальный номер nezaika",
+                f"date={current_number}",
+                f"image={image_path.name}"
+            )
+
+    if image_path is None:
+        raise FileNotFoundError(
+            f"В папке {nezaika_dir} нет ни одной подходящей картинки MM.DD.*"
+        )
+
+    # pack_number остаётся номером ТЕКУЩЕЙ даты.
+    # Это гарантирует создание нового pinned post при смене дня,
+    # даже если используется одна и та же fallback-картинка.
+    return current_number, image_path
+
+
+def _load_text_state(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip() or None
+    except Exception:
+        return None
+
+
+def _save_text_state(path, value):
+    Path(path).write_text(str(value), encoding="utf-8")
 
 
 def telegram_channel_message_url(message_id):
@@ -522,13 +630,13 @@ def make_services_text():
     return "\n".join(lines)
 
 
-def _send_services_post(text):
-    """
-    Создаёт сервисный пост как ФОТО + подпись со ссылками.
-    """
-    if not SERVICES_BANNER_FILE.exists():
+def _send_services_post(text, image_path):
+    """Создаёт сервисный пост как ФОТО + подпись со ссылками."""
+    image_path = Path(image_path)
+
+    if not image_path.exists():
         raise FileNotFoundError(
-            f"Не найдена картинка сервисов: {SERVICES_BANNER_FILE}"
+            f"Не найдена картинка сервисов: {image_path}"
         )
 
     url = (
@@ -536,7 +644,7 @@ def _send_services_post(text):
         f"bot{BOT_TOKEN}/sendPhoto"
     )
 
-    with SERVICES_BANNER_FILE.open("rb") as photo_file:
+    with image_path.open("rb") as photo_file:
         response = requests.post(
             url,
             data={
@@ -546,9 +654,8 @@ def _send_services_post(text):
             },
             files={
                 "photo": (
-                    SERVICES_BANNER_FILE.name,
+                    image_path.name,
                     photo_file,
-                    "image/png",
                 )
             },
             timeout=60,
@@ -564,10 +671,7 @@ def _send_services_post(text):
 
 
 def _edit_services_post(message_id, text):
-    """
-    Обновляет подпись уже существующего сервисного фото-поста.
-    Картинка и message_id остаются прежними.
-    """
+    """Обновляет подпись уже существующего сервисного фото-поста."""
     url = (
         f"https://api.telegram.org/"
         f"bot{BOT_TOKEN}/editMessageCaption"
@@ -594,10 +698,7 @@ def _edit_services_post(message_id, text):
 
 
 def unpin_services_post(message_id):
-    """
-    Снимает закрепление со старого сервисного поста.
-    Ошибка не останавливает сервер.
-    """
+    """Снимает закрепление со старого сервисного поста."""
     try:
         url = (
             f"https://api.telegram.org/"
@@ -632,11 +733,7 @@ def unpin_services_post(message_id):
 
 
 def pin_services_post(message_id):
-    """
-    Пытаемся закрепить навигатор без уведомления.
-    Если у бота нет права pin_messages, работа остальных
-    модулей не прерывается.
-    """
+    """Закрепляет сервисный пост без уведомления."""
     try:
         url = (
             f"https://api.telegram.org/"
@@ -678,27 +775,45 @@ def pin_services_post(message_id):
 
 def update_services_post():
     """
-    Создаёт навигатор один раз, затем только редактирует его.
+    В пределах одной даты редактирует существующий pinned post.
+    При смене MM.DD создаёт новый пост с nezaika/MM.DD.*.
     """
     text = make_services_text()
+    pack_number, image_path = current_services_image()
+
     message_id = load_id_file(
         SERVICES_MESSAGE_ID_FILE
     )
+    saved_pack_number = _load_text_state(
+        SERVICES_PACK_NUMBER_FILE
+    )
 
-    if message_id is None:
-        message_id = _send_services_post(text)
+    # Новый день / первый запуск новой схемы: новый pinned post.
+    if message_id is None or saved_pack_number != pack_number:
+        old_id = message_id
+        new_id = _send_services_post(text, image_path)
+
         save_id_file(
             SERVICES_MESSAGE_ID_FILE,
-            message_id
+            new_id
+        )
+        _save_text_state(
+            SERVICES_PACK_NUMBER_FILE,
+            pack_number
         )
 
         log_line(
-            "СЕРВИСЫ: создан навигационный пост",
-            f"message_id={message_id}"
+            "СЕРВИСЫ: создан новый дневной навигационный пост",
+            f"pack={pack_number}",
+            f"image={image_path.name}",
+            f"message_id={new_id}"
         )
 
-        pin_services_post(message_id)
-        return message_id
+        if old_id is not None:
+            unpin_services_post(old_id)
+
+        pin_services_post(new_id)
+        return new_id
 
     try:
         _edit_services_post(
@@ -708,13 +823,11 @@ def update_services_post():
 
         log_line(
             "СЕРВИСЫ: навигационный пост обновлён",
+            f"pack={pack_number}",
             f"message_id={message_id}"
         )
 
-        # Гарантируем, что сервисный навигатор остаётся
-        # закреплённым сверху канала после любого обновления.
         pin_services_post(message_id)
-
         return message_id
 
     except Exception as exc:
@@ -727,15 +840,20 @@ def update_services_post():
             or "400 client error" in description
         ):
             old_id = message_id
+            new_id = _send_services_post(text, image_path)
 
-            new_id = _send_services_post(text)
             save_id_file(
                 SERVICES_MESSAGE_ID_FILE,
                 new_id
             )
+            _save_text_state(
+                SERVICES_PACK_NUMBER_FILE,
+                pack_number
+            )
 
             log_line(
-                "СЕРВИСЫ: старый текстовый пост заменён фото-постом",
+                "СЕРВИСЫ: старый пост заменён новым",
+                f"pack={pack_number}",
                 f"old_message_id={old_id}",
                 f"new_message_id={new_id}"
             )
@@ -1685,6 +1803,9 @@ def update_weather(force_new=False):
     )
 
     safe_update_services_post()
+
+    # Контент-пакет обновляется при КАЖДОМ обновлении погоды.
+    publish_content_pack("ПОГОДА")
 
     return message_id
 
@@ -3448,6 +3569,9 @@ def update_flight_board():
 
     safe_update_services_post()
 
+    # Контент-пакет обновляется при КАЖДОМ обновлении табло рейсов.
+    publish_content_pack("БЕН-ГУРИОН")
+
     return message_ids
 
 
@@ -3786,6 +3910,9 @@ def update_rates():
 
     safe_update_services_post()
 
+    # Контент-пакет обновляется при КАЖДОМ обновлении валют.
+    publish_content_pack("ВАЛЮТЫ")
+
     return message_id
 
 
@@ -3937,6 +4064,9 @@ def update_time_post():
     )
 
     safe_update_services_post()
+
+    # Контент-пакет обновляется при КАЖДОМ обновлении мирового времени.
+    publish_content_pack("МИРОВОЕ ВРЕМЯ")
 
     return message_id
 
@@ -8766,25 +8896,21 @@ def start_news_dispatch(reason="по расписанию"):
 
 # =========================================================
 # КОНТЕНТ-ПАКЕТЫ ДЛЯ ОБНОВЛЕНИЙ НОВОСТНЫХ ЛЕНТ
+# | 3.8.11
 # =========================================================
-#
-# C:\ne_zaika_bot\
-#   nezaika\1.<любое расширение картинки>
-#   photos\1.<любое расширение картинки>
-#   stories\1.<любое расширение текста>
-#
-# Имя файла = только номер.
-# Расширение специально НЕ фиксируется.
-# Один номер связывает все три элемента.
+# Текущий номер пакета определяется датой Израиля:
+#   MM.DD
+# Например 30 августа = 08.30.
+# Один и тот же номер связывает:
+#   nezaika\08.30.*
+#   photos\08.30.*
+#   stories\08.30.*
+# Расширение не фиксируется.
 # =========================================================
 
 NEZAIKA_DIR = Path(BASE_DIR) / "nezaika"
 AI_PHOTOS_DIR = Path(BASE_DIR) / "photos"
 MINISTORY_DIR = Path(BASE_DIR) / "stories"
-
-CONTENT_PACK_STATE_FILE = state_file(
-    "content_pack_next_number.txt"
-)
 
 CONTENT_IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp"
@@ -8797,148 +8923,157 @@ CONTENT_TEXT_EXTENSIONS = {
 CONTENT_PACK_LOCK = threading.RLock()
 
 
-def _numbered_files(folder, allowed_extensions):
-    """
-    Возвращает:
-        {1: Path(...), 2: Path(...), ...}
-
-    Учитываются только файлы, у которых имя ДО точки —
-    целое положительное число: 1.png, 2.jpg, 17.webp и т.д.
-    """
-    result = {}
-
-    if not folder.exists():
-        return result
-
-    for path in folder.iterdir():
-        if not path.is_file():
-            continue
-
-        if path.suffix.lower() not in allowed_extensions:
-            continue
-
-        if not path.stem.isdigit():
-            continue
-
-        number = int(path.stem)
-
-        if number <= 0:
-            continue
-
-        # Если случайно лежат 1.png и 1.jpg —
-        # берём первый найденный, но номер остаётся один.
-        result.setdefault(number, path)
-
-    return result
-
-
-def available_content_packs():
-    """
-    Возвращает только номера ПОЛНЫХ комплектов:
-      nezaika/N.*
-      photos/N.*
-      stories/N.*
-    """
-    nezaika = _numbered_files(
-        NEZAIKA_DIR,
-        CONTENT_IMAGE_EXTENSIONS
-    )
-    photos = _numbered_files(
-        AI_PHOTOS_DIR,
-        CONTENT_IMAGE_EXTENSIONS
-    )
-    stories = _numbered_files(
-        MINISTORY_DIR,
-        CONTENT_TEXT_EXTENSIONS
-    )
-
-    numbers = sorted(
-        set(nezaika)
-        & set(photos)
-        & set(stories)
-    )
-
-    return numbers, nezaika, photos, stories
-
-
-def load_next_content_number():
-    try:
-        value = Path(
-            CONTENT_PACK_STATE_FILE
-        ).read_text(
-            encoding="utf-8"
-        ).strip()
-
-        return int(value)
-
-    except Exception:
-        return None
-
-
-def save_next_content_number(number):
-    Path(
-        CONTENT_PACK_STATE_FILE
-    ).write_text(
-        str(number),
-        encoding="utf-8"
-    )
-
-
 def get_next_content_pack():
     """
-    Берёт следующий полный комплект.
-    После последнего номера начинает снова с первого.
+    Контент для ТЕКУЩЕЙ даты MM.DD.
 
-    Если, например, есть 1, 2, 5 — порядок будет:
-    1 -> 2 -> 5 -> 1 ...
+    nezaika:
+      - сначала MM.DD.*;
+      - если нет — файл с минимальным номером MM.DD из папки nezaika.
+
+    photos и stories:
+      - только точное MM.DD.*;
+      - если файла нет, соответствующий элемент просто пропускается.
     """
     with CONTENT_PACK_LOCK:
-        numbers, nezaika, photos, stories = (
-            available_content_packs()
+        number = current_content_pack_number()
+
+        nezaika = _find_dated_file(
+            NEZAIKA_DIR,
+            number,
+            CONTENT_IMAGE_EXTENSIONS,
         )
 
-        if not numbers:
+        nezaika_fallback = False
+        if nezaika is None:
+            nezaika = _find_min_numbered_file(
+                NEZAIKA_DIR,
+                CONTENT_IMAGE_EXTENSIONS,
+            )
+            nezaika_fallback = nezaika is not None
+
+        photo = _find_dated_file(
+            AI_PHOTOS_DIR,
+            number,
+            CONTENT_IMAGE_EXTENSIONS,
+        )
+        story = _find_dated_file(
+            MINISTORY_DIR,
+            number,
+            CONTENT_TEXT_EXTENSIONS,
+        )
+
+        if nezaika is None:
+            log_line(
+                "КОНТЕНТ:",
+                f"№{number}",
+                "в папке nezaika нет ни текущего файла, "
+                "ни fallback-файла MM.DD.*"
+            )
             return None
 
-        wanted = load_next_content_number()
+        if nezaika_fallback:
+            log_line(
+                "КОНТЕНТ:",
+                f"№{number}",
+                f"nezaika\\{number}.* нет — беру минимальный {nezaika.name}"
+            )
 
-        if wanted in numbers:
-            number = wanted
-        else:
-            # Если сохранённого номера нет — берём первый
-            # существующий номер >= wanted, иначе первый вообще.
-            number = None
+        if photo is None:
+            log_line(
+                "КОНТЕНТ:",
+                f"№{number}",
+                f"photos\\{number}.* нет — пропускаю"
+            )
 
-            if wanted is not None:
-                for candidate in numbers:
-                    if candidate >= wanted:
-                        number = candidate
-                        break
-
-            if number is None:
-                number = numbers[0]
-
-        position = numbers.index(number)
-        next_number = numbers[
-            (position + 1) % len(numbers)
-        ]
-
-        save_next_content_number(
-            next_number
-        )
+        if story is None:
+            log_line(
+                "КОНТЕНТ:",
+                f"№{number}",
+                f"stories\\{number}.* нет — пропускаю"
+            )
 
         return {
             "number": number,
-            "nezaika": nezaika[number],
-            "photo": photos[number],
-            "story": stories[number],
+            "nezaika": nezaika,
+            "nezaika_fallback": nezaika_fallback,
+            "photo": photo,
+            "story": story,
         }
 
 
+def publish_content_pack(section_name):
+    """
+    Публикует контент текущей даты MM.DD:
+      1. НеЗайка — всегда, с fallback на минимальный номер;
+      2. ИИ-фото — только если есть точный MM.DD.*;
+      3. МиниСТОРИ — только если есть точный MM.DD.*.
+    """
+    pack = get_next_content_pack()
+
+    if pack is None:
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            "в папке nezaika нет подходящих файлов MM.DD.*"
+        )
+        return False
+
+    number = pack["number"]
+
+    try:
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"№{number} — публикация; nezaika={pack['nezaika'].name}"
+        )
+
+        _telegram_send_photo_file(
+            pack["nezaika"]
+        )
+
+        if pack["photo"] is not None:
+            time.sleep(1.1)
+            _telegram_send_photo_file(
+                pack["photo"]
+            )
+
+        if pack["story"] is not None:
+            story_bytes = pack["story"].read_bytes()
+            story_text = None
+
+            for story_encoding in ("utf-8-sig", "utf-8", "cp1251"):
+                try:
+                    story_text = story_bytes.decode(story_encoding).strip()
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if story_text is None:
+                story_text = story_bytes.decode(
+                    "cp1251",
+                    errors="replace"
+                ).strip()
+
+            if story_text:
+                time.sleep(1.1)
+                send_message(story_text)
+
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"№{number} опубликован"
+        )
+        return True
+
+    except Exception as exc:
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"ОШИБКА №{number}:",
+            exc
+        )
+        return False
+
+
 def _telegram_send_photo_file(image_path, caption=None):
-    """
-    Отправляет локальную картинку в канал.
-    """
+    """Отправляет локальную картинку в канал."""
     url = (
         f"https://api.telegram.org/"
         f"bot{BOT_TOKEN}/sendPhoto"
@@ -8972,82 +9107,6 @@ def _telegram_send_photo_file(image_path, caption=None):
         raise RuntimeError(body)
 
     return body["result"]["message_id"]
-
-
-def publish_content_pack(section_name):
-    """
-    Публикует три элемента ОДНОГО номера:
-
-      1. НеЗайка
-      2. ИИ-фото
-      3. МиниСТОРИ
-
-    Вызывается только если соответствующая новостная
-    лента действительно что-то опубликовала.
-    """
-    pack = get_next_content_pack()
-
-    if pack is None:
-        log_line(
-            f"КОНТЕНТ / {section_name}: "
-            "полных комплектов не найдено"
-        )
-        return False
-
-    number = pack["number"]
-
-    try:
-        story_bytes = pack["story"].read_bytes()
-        story_text = None
-        for story_encoding in ("utf-8-sig", "utf-8", "cp1251"):
-            try:
-                story_text = story_bytes.decode(story_encoding).strip()
-                break
-            except UnicodeDecodeError:
-                continue
-
-        if story_text is None:
-            story_text = story_bytes.decode("cp1251", errors="replace").strip()
-
-        log_line(
-            f"КОНТЕНТ / {section_name}: "
-            f"комплект №{number} — публикация"
-        )
-
-        # 1. НеЗайка
-        _telegram_send_photo_file(
-            pack["nezaika"]
-        )
-
-        time.sleep(1.1)
-
-        # 2. ИИ-фото
-        _telegram_send_photo_file(
-            pack["photo"]
-        )
-
-        time.sleep(1.1)
-
-        # 3. МиниСТОРИ
-        if story_text:
-            send_message(
-                story_text
-            )
-
-        log_line(
-            f"КОНТЕНТ / {section_name}: "
-            f"комплект №{number} опубликован"
-        )
-
-        return True
-
-    except Exception as exc:
-        log_line(
-            f"КОНТЕНТ / {section_name}: "
-            f"ОШИБКА комплекта №{number}:",
-            exc
-        )
-        return False
 
 
 def run_all_news_checks():
