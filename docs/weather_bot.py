@@ -1,6 +1,6 @@
 # =========================================================
-# Добавлен постоянный пост-сервис с короткими ссылками на актуальные погоду / рейсы / валюты / время
-# | 3.8.0
+# ОТМЕНА ПРОСТЫНЕЙ: сервисный навигатор закреплён сверху канала
+# | 3.8.2
 # =========================================================
 
 
@@ -418,7 +418,7 @@ def update_persistent_post(text, filename):
 
 # =========================================================
 # 0.3. СЕРВИСЫ — ПОСТ-НАВИГАТОР
-# | 3.7.6
+# | 3.8.0
 # =========================================================
 # Один постоянный пост со ссылками на последние сервисные
 # сообщения. После обновления погоды / рейсов / валют /
@@ -644,6 +644,11 @@ def update_services_post():
             "СЕРВИСЫ: навигационный пост обновлён",
             f"message_id={message_id}"
         )
+
+        # Гарантируем, что сервисный навигатор остаётся
+        # закреплённым сверху канала после любого обновления.
+        pin_services_post(message_id)
+
         return message_id
 
     except Exception as exc:
@@ -1594,22 +1599,18 @@ def save_weather_slot(slot):
 
 
 def update_weather(force_new=False):
-    # Каждое обновление погоды — новый пост.
-    # Его message_id сохраняется для поста-навигации.
-    now = datetime.now(TZ)
+    # Один постоянный подробный пост погоды.
+    # При последующих обновлениях только редактируется —
+    # новых погодных простыней в ленте не создаём.
     text = make_weather_text()
 
-    message_id = send_message(
-        text
-    )
-
-    save_id_file(
-        WEATHER_MESSAGE_ID_FILE,
-        message_id
+    message_id = update_persistent_post(
+        text,
+        WEATHER_MESSAGE_ID_FILE
     )
 
     log_line(
-        "ПОГОДА: опубликован новый пост",
+        "ПОГОДА: постоянный пост обновлён",
         f"message_id={message_id}"
     )
 
@@ -3302,69 +3303,14 @@ def make_flight_alerts_text(
 
 
 def create_flight_board_posts():
-    print(
-        "БЕН-ГУРИОН / DATA.GOV.IL: "
-        "создаю 5 новых постов..."
-    )
-
-    flights = get_flights()
-
-    posts = [
-        (
-            make_flights_text(
-                flights,
-                "A",
-                "actual"
-            ),
-            ARRIVALS_ACTUAL_MESSAGE_ID_FILE
-        ),
-        (
-            make_flights_text(
-                flights,
-                "A",
-                "next"
-            ),
-            ARRIVALS_NEXT_MESSAGE_ID_FILE
-        ),
-        (
-            make_flights_text(
-                flights,
-                "D",
-                "actual"
-            ),
-            DEPARTURES_ACTUAL_MESSAGE_ID_FILE
-        ),
-        (
-            make_flights_text(
-                flights,
-                "D",
-                "next"
-            ),
-            DEPARTURES_NEXT_MESSAGE_ID_FILE
-        ),
-        (
-            make_flight_alerts_text(
-                flights
-            ),
-            FLIGHT_ALERTS_MESSAGE_ID_FILE
-        ),
-    ]
-
-    for post_text, id_file in posts:
-        message_id = send_message(
-            post_text
-        )
-
-        save_id_file(
-            id_file,
-            message_id
-        )
+    # Совместимость со старыми вызовами: новых постов НЕ создаём.
+    return update_flight_board()
 
 
 def update_flight_board():
     print(
         "БЕН-ГУРИОН / DATA.GOV.IL: "
-        "создаю 5 новых постов..."
+        "обновляю 5 постоянных постов..."
     )
 
     flights = get_flights()
@@ -3372,95 +3318,55 @@ def update_flight_board():
     posts = [
         (
             "ПРИЛЁТЫ — ФАКТИЧЕСКИЕ",
-            make_flights_text(
-                flights,
-                "A",
-                "actual"
-            )
+            make_flights_text(flights, "A", "actual"),
+            ARRIVALS_ACTUAL_MESSAGE_ID_FILE
         ),
         (
             "ПРИЛЁТЫ — БЛИЖАЙШИЕ",
-            make_flights_text(
-                flights,
-                "A",
-                "next"
-            )
+            make_flights_text(flights, "A", "next"),
+            ARRIVALS_NEXT_MESSAGE_ID_FILE
         ),
         (
             "ВЫЛЕТЫ — ФАКТИЧЕСКИЕ",
-            make_flights_text(
-                flights,
-                "D",
-                "actual"
-            )
+            make_flights_text(flights, "D", "actual"),
+            DEPARTURES_ACTUAL_MESSAGE_ID_FILE
         ),
         (
             "ВЫЛЕТЫ — БЛИЖАЙШИЕ",
-            make_flights_text(
-                flights,
-                "D",
-                "next"
-            )
+            make_flights_text(flights, "D", "next"),
+            DEPARTURES_NEXT_MESSAGE_ID_FILE
         ),
         (
             "ИЗМЕНЕНИЯ",
-            make_flight_alerts_text(
-                flights
-            )
+            make_flight_alerts_text(flights),
+            FLIGHT_ALERTS_MESSAGE_ID_FILE
         ),
     ]
 
     message_ids = []
 
-    state_files = {
-        "ПРИЛЁТЫ — ФАКТИЧЕСКИЕ": ARRIVALS_ACTUAL_MESSAGE_ID_FILE,
-        "ПРИЛЁТЫ — БЛИЖАЙШИЕ": ARRIVALS_NEXT_MESSAGE_ID_FILE,
-        "ВЫЛЕТЫ — ФАКТИЧЕСКИЕ": DEPARTURES_ACTUAL_MESSAGE_ID_FILE,
-        "ВЫЛЕТЫ — БЛИЖАЙШИЕ": DEPARTURES_NEXT_MESSAGE_ID_FILE,
-        "ИЗМЕНЕНИЯ": FLIGHT_ALERTS_MESSAGE_ID_FILE,
-    }
-
-    for post_name, post_text in posts:
-
-        original_length = len(
-            post_text
-        )
+    for post_name, post_text, state_filename in posts:
+        original_length = len(post_text)
 
         print()
-        print(
-            "БЕН-ГУРИОН:",
-            post_name
-        )
+        print("БЕН-ГУРИОН:", post_name)
         print(
             "Размер до глобального лимита:",
             f"{original_length}/{TELEGRAM_TEXT_LIMIT}"
         )
 
         try:
-            message_id = send_message(
-                post_text
+            message_id = update_persistent_post(
+                post_text,
+                state_filename
             )
-
-            message_ids.append(
-                message_id
-            )
-
-            state_filename = state_files.get(
-                post_name
-            )
-
-            if state_filename:
-                save_id_file(
-                    state_filename,
-                    message_id
-                )
-
+            message_ids.append(message_id)
             print(
                 "БЕН-ГУРИОН:",
                 post_name,
-                "— OK"
+                "— постоянный пост обновлён; message_id=",
+                message_id
             )
-
         except Exception as error:
             print(
                 "БЕН-ГУРИОН:",
@@ -3468,9 +3374,6 @@ def update_flight_board():
                 "— ОШИБКА:",
                 error
             )
-
-            # ВАЖНО:
-            # ошибка одного поста не останавливает следующие.
             continue
 
     safe_update_services_post()
@@ -3792,42 +3695,20 @@ def make_rates_text():
 
 
 def create_rates_post():
-    """
-    При запуске сервера создаём новый валютный пост.
-    """
-    message_id = send_message(
-        make_rates_text()
-    )
-
-    save_id_file(
-        RATES_MESSAGE_ID_FILE,
-        message_id
-    )
-
-    print(
-        "ВАЛЮТЫ: создан новый пост:",
-        datetime.now(TZ).strftime("%H:%M:%S"),
-        "message_id:",
-        message_id
-    )
-
-    return message_id
+    # Совместимость со старыми вызовами: новых постов НЕ создаём.
+    return update_rates()
 
 
 def update_rates():
-    # Каждое обновление валют — новый пост.
-    # Последний message_id используется в посте-навигации.
-    message_id = send_message(
-        make_rates_text()
-    )
-
-    save_id_file(
-        RATES_MESSAGE_ID_FILE,
-        message_id
+    # Один постоянный подробный пост валют.
+    # Дальше только редактируем его.
+    message_id = update_persistent_post(
+        make_rates_text(),
+        RATES_MESSAGE_ID_FILE
     )
 
     print(
-        "ВАЛЮТЫ: создан новый пост:",
+        "ВАЛЮТЫ: постоянный пост обновлён:",
         datetime.now(TZ).strftime("%H:%M:%S"),
         "message_id:",
         message_id
@@ -3973,19 +3854,16 @@ def make_time_text():
     return "\n".join(lines)
 
 def create_time_post():
-    return send_message(
-        make_time_text()
-    )
+    # Совместимость со старыми вызовами: новых постов НЕ создаём.
+    return update_time_post()
 
 
 def update_time_post():
-    # Каждое обновление — новый пост.
-    # Последний message_id используется в посте-навигации.
-    message_id = create_time_post()
-
-    save_id_file(
-        TIME_MESSAGE_ID_FILE,
-        message_id
+    # Один постоянный подробный пост мирового времени.
+    # Дальше только редактируем его.
+    message_id = update_persistent_post(
+        make_time_text(),
+        TIME_MESSAGE_ID_FILE
     )
 
     safe_update_services_post()
@@ -4896,12 +4774,16 @@ VOA_SCIENCE_RSS_URL = "https://www.voanews.com/api/ztbopl-vomx-tpekvmm"
 
 VOA_TECHNOLOGY_RSS_URL = "https://www.voanews.com/api/zyritl-vomx-tpettmq"
 VOA_ECONOMY_RSS_URL = "https://www.voanews.com/api/zyboql-vomx-tpetvmi"
+VOA_ARTS_CULTURE_RSS_URL = "https://www.voanews.com/api/zpbovl-vomx-tpe_vmr"
 
 TECHNOLOGY_NEWS_SEEN_FILE = state_file("technology_news_seen.json")
 TECHNOLOGY_NEWS_FIRST_RUN = True
 
 ECONOMY_NEWS_SEEN_FILE = state_file("economy_news_seen.json")
 ECONOMY_NEWS_FIRST_RUN = True
+
+ARTS_CULTURE_NEWS_SEEN_FILE = state_file("arts_culture_news_seen.json")
+ARTS_CULTURE_NEWS_FIRST_RUN = True
 
 SCIENCE_NEWS_SEEN_FILE = state_file("science_news_seen.json")
 SCIENCE_NEWS_FIRST_RUN = True
@@ -6615,51 +6497,19 @@ def check_telegram_commands(offset=None):
                 )
 
             elif command == "/arrivals":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста прилётов."
+                    "Прилёты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/departures":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста вылетов."
+                    "Вылеты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/time":
@@ -6667,7 +6517,7 @@ def check_telegram_commands(offset=None):
 
                 send_private_reply(
                     chat_id,
-                    "Создан новый пост мирового времени."
+                    "Мировое время обновлено в постоянном посте. Новый пост не создан."
                 )
 
             elif command == "/flights":
@@ -6801,6 +6651,17 @@ def check_telegram_commands(offset=None):
                     chat_id,
                     (
                         "Экономика VOA проверена. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
+            elif command == "/culture":
+                published = check_arts_culture_news()
+
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Arts & Culture VOA проверены. "
                         f"Опубликовано новых: {published}."
                     )
                 )
@@ -7251,51 +7112,19 @@ def check_telegram_commands(offset=None):
                 )
 
             elif command == "/arrivals":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста прилётов."
+                    "Прилёты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/departures":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста вылетов."
+                    "Вылеты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/time":
@@ -7303,7 +7132,7 @@ def check_telegram_commands(offset=None):
 
                 send_private_reply(
                     chat_id,
-                    "Создан новый пост мирового времени."
+                    "Мировое время обновлено в постоянном посте. Новый пост не создан."
                 )
 
             elif command == "/flights":
@@ -7816,51 +7645,19 @@ def check_telegram_commands(offset=None):
                 )
 
             elif command == "/arrivals":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "A",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста прилётов."
+                    "Прилёты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/departures":
-                flights = get_flights()
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "actual"
-                    )
-                )
-
-                send_message(
-                    make_flights_text(
-                        flights,
-                        "D",
-                        "next"
-                    )
-                )
+                update_flight_board()
 
                 send_private_reply(
                     chat_id,
-                    "Созданы 2 новых поста вылетов."
+                    "Вылеты обновлены в постоянных постах. Новых постов не создано."
                 )
 
             elif command == "/time":
@@ -7868,7 +7665,7 @@ def check_telegram_commands(offset=None):
 
                 send_private_reply(
                     chat_id,
-                    "Создан новый пост мирового времени."
+                    "Мировое время обновлено в постоянном посте. Новый пост не создан."
                 )
 
             elif command == "/flights":
@@ -8591,6 +8388,92 @@ def check_economy_news():
         return 0
 
 
+
+def check_arts_culture_news():
+    global ARTS_CULTURE_NEWS_FIRST_RUN
+    label = "КУЛЬТУРА"
+    log_line(f"{label} NEWS: запуск проверки")
+
+    try:
+        items = _fetch_voa_category_news(
+            VOA_ARTS_CULTURE_RSS_URL,
+            "ARTS & CULTURE"
+        )
+        seen = _load_seen_simple_news(
+            ARTS_CULTURE_NEWS_SEEN_FILE,
+            label
+        )
+
+        if ARTS_CULTURE_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            log_line(
+                f"{label} NEWS: запуск сервера — публикую последние",
+                len(to_publish)
+            )
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(
+            reversed(to_publish),
+            start=1
+        ):
+            message = _make_voa_category_text(
+                item,
+                "🎭 КУЛЬТУРА"
+            )
+
+            log_line(
+                f"{label} NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            _send_voa_category_message(message)
+
+            published += 1
+
+            log_line(
+                f"{label} NEWS: опубликовано "
+                f"{index}/{len(to_publish)}:",
+                item.get("url", "")
+            )
+
+        # Запоминаем весь текущий RSS, чтобы после стартовых
+        # 10 не вывалить старый хвост на следующем :00.
+        for item in items:
+            if item.get("url"):
+                seen.add(item["url"])
+
+        _save_seen_simple_news(
+            ARTS_CULTURE_NEWS_SEEN_FILE,
+            seen,
+            label
+        )
+
+        ARTS_CULTURE_NEWS_FIRST_RUN = False
+
+        log_line(
+            f"{label} NEWS: опубликовано всего:",
+            published
+        )
+        log_line(
+            f"{label} NEWS: проверка завершена"
+        )
+
+        return published
+
+    except Exception as exc:
+        log_line(
+            f"{label} NEWS — ОШИБКА:",
+            exc
+        )
+        return 0
+
+
 # ЕДИНЫЙ ДИСПЕТЧЕР НОВОСТЕЙ
 # =========================================================
 # При запуске сервера выполняет стартовую проверку всех веток последовательно.
@@ -8675,6 +8558,7 @@ def run_all_news_checks():
         ("WORLD", check_world_news),
         ("ТЕХНОЛОГИИ", check_technology_news),
         ("ЭКОНОМИКА", check_economy_news),
+        ("КУЛЬТУРА", check_arts_culture_news),
         ("БЛИЖНИЙ ВОСТОК", check_middle_east_news),
         ("ЕВРОПА", check_europe_news),
         ("УКРАИНА", check_ukraine_news),
@@ -8771,7 +8655,7 @@ def main():
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
 
-    # При каждом запуске — новые посты.
+    # При запуске обновляем постоянные сервисные посты; новых простыней не создаём.
     try:
         update_weather()
     except Exception as error:
@@ -8838,10 +8722,10 @@ def main():
         "ДИСПЕТЧЕР ЗАПУЩЕН."
     )
     print(
-        "Погода: новый пост каждый час."
+        "Погода: редактируется постоянный пост каждый час."
     )
     print(
-        "Бен-Гурион: 5 новых постов в :00 и :30."
+        "Бен-Гурион: редактируются 5 постоянных постов в :00 и :30."
     )
     print(
         "Новости Хайфы: проверка раз в час."
@@ -8850,10 +8734,10 @@ def main():
         "Новости: главный диспетчер; старт сразу, затем проверка при каждом переходе на новый час (:00)."
     )
     print(
-        "Валюты: новый пост в 08:00, 12:00, 16:00, 20:00."
+        "Валюты: редактируется постоянный пост в 08:00, 12:00, 16:00, 20:00."
     )
     print(
-        "Мировое время: новый пост каждый час."
+        "Мировое время: редактируется постоянный пост каждый час."
     )
 
     while True:
@@ -8861,7 +8745,7 @@ def main():
         now = datetime.now(TZ)
 
         # ---------------------------------------------
-        # ПОГОДА — НОВЫЙ ПОСТ КАЖДЫЙ ЧАС
+        # ПОГОДА — ОБНОВЛЕНИЕ ПОСТОЯННОГО ПОСТА КАЖДЫЙ ЧАС
         # ---------------------------------------------
         current_weather_key = (
             weather_schedule_key(now)
@@ -8883,7 +8767,7 @@ def main():
                 )
 
         # ---------------------------------------------
-        # ВАЛЮТЫ — НОВЫЙ ПОСТ 08 / 12 / 16 / 20
+        # ВАЛЮТЫ — ОБНОВЛЕНИЕ ПОСТОЯННОГО ПОСТА 08 / 12 / 16 / 20
         # ---------------------------------------------
         current_rates_key = (
             rates_schedule_key(now)
@@ -8906,7 +8790,7 @@ def main():
                 )
 
         # ---------------------------------------------
-        # МИРОВОЕ ВРЕМЯ — НОВЫЙ ПОСТ КАЖДЫЙ ЧАС
+        # МИРОВОЕ ВРЕМЯ — ОБНОВЛЕНИЕ ПОСТОЯННОГО ПОСТА КАЖДЫЙ ЧАС
         # ---------------------------------------------
         current_time_key = (
             time_schedule_key(now)
