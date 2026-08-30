@@ -1,6 +1,6 @@
 # =========================================================
-# СМЕНА ИМЕНИ: проверка уровня доступа бота
-# | 3.8.5
+# КОНТЕНТ-ПАКЕТ В НАЧАЛЕ КАЖДОЙ ВЫДАЧИ, ДАЖЕ БЕЗ НОВОСТЕЙ; СТОРИ: UTF-8 / BOM / CP1251
+# | 3.8.10
 # =========================================================
 
 
@@ -420,13 +420,17 @@ def update_persistent_post(text, filename):
 # 0.3. СЕРВИСЫ — ПОСТ-НАВИГАТОР
 # | 3.8.0
 # =========================================================
-# Один постоянный пост со ссылками на последние сервисные
+# Один постоянный ФОТО-пост со ссылками на последние сервисные
 # сообщения. После обновления погоды / рейсов / валют /
 # мирового времени навигатор редактируется автоматически.
 # =========================================================
 
 SERVICES_MESSAGE_ID_FILE = state_file("services_message_id.txt")
 TIME_MESSAGE_ID_FILE = state_file("time_message_id.txt")
+
+# Картинка закреплённого сервисного поста.
+# Файл services_banner.png должен лежать рядом с ne_zaika_bot.py.
+SERVICES_BANNER_FILE = Path(__file__).resolve().parent / "services_banner.png"
 
 
 def telegram_channel_message_url(message_id):
@@ -519,15 +523,36 @@ def make_services_text():
 
 
 def _send_services_post(text):
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
+    """
+    Создаёт сервисный пост как ФОТО + подпись со ссылками.
+    """
+    if not SERVICES_BANNER_FILE.exists():
+        raise FileNotFoundError(
+            f"Не найдена картинка сервисов: {SERVICES_BANNER_FILE}"
+        )
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendPhoto"
     )
+
+    with SERVICES_BANNER_FILE.open("rb") as photo_file:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHANNEL,
+                "caption": text,
+                "parse_mode": "HTML",
+            },
+            files={
+                "photo": (
+                    SERVICES_BANNER_FILE.name,
+                    photo_file,
+                    "image/png",
+                )
+            },
+            timeout=60,
+        )
 
     response.raise_for_status()
     data = response.json()
@@ -539,9 +564,13 @@ def _send_services_post(text):
 
 
 def _edit_services_post(message_id, text):
+    """
+    Обновляет подпись уже существующего сервисного фото-поста.
+    Картинка и message_id остаются прежними.
+    """
     url = (
         f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/editMessageText"
+        f"bot{BOT_TOKEN}/editMessageCaption"
     )
 
     response = requests.post(
@@ -549,9 +578,8 @@ def _edit_services_post(message_id, text):
         data={
             "chat_id": CHANNEL,
             "message_id": message_id,
-            "text": text,
+            "caption": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,
         },
         timeout=30,
     )
@@ -563,6 +591,44 @@ def _edit_services_post(message_id, text):
         raise RuntimeError(data)
 
     return data["result"]["message_id"]
+
+
+def unpin_services_post(message_id):
+    """
+    Снимает закрепление со старого сервисного поста.
+    Ошибка не останавливает сервер.
+    """
+    try:
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{BOT_TOKEN}/unpinChatMessage"
+        )
+
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHANNEL,
+                "message_id": message_id,
+            },
+            timeout=20,
+        )
+
+        if response.ok:
+            data = response.json()
+            if data.get("ok"):
+                log_line(
+                    "СЕРВИСЫ: старый пост откреплён",
+                    f"message_id={message_id}"
+                )
+                return True
+
+    except Exception as exc:
+        log_line(
+            "СЕРВИСЫ: ошибка снятия старого закрепления:",
+            exc
+        )
+
+    return False
 
 
 def pin_services_post(message_id):
@@ -608,76 +674,6 @@ def pin_services_post(message_id):
         )
 
     return False
-
-
-def debug_bot_rights():
-    print("BOT RIGHTS CHECK: START")
-    """
-    Показывает, какие права Telegram реально видит у бота в канале.
-    """
-    try:
-        me_url = (
-            f"https://api.telegram.org/"
-            f"bot{BOT_TOKEN}/getMe"
-        )
-
-        me_response = requests.get(
-            me_url,
-            timeout=20,
-        )
-        me_data = me_response.json()
-
-        if not me_data.get("ok"):
-            log_line(
-                "TELEGRAM BOT RIGHTS: getMe ошибка:",
-                me_response.text[:300]
-            )
-            return False
-
-        bot_id = me_data["result"]["id"]
-
-        member_url = (
-            f"https://api.telegram.org/"
-            f"bot{BOT_TOKEN}/getChatMember"
-        )
-
-        member_response = requests.get(
-            member_url,
-            params={
-                "chat_id": CHANNEL,
-                "user_id": bot_id,
-            },
-            timeout=20,
-        )
-        member_data = member_response.json()
-
-        if not member_data.get("ok"):
-            log_line(
-                "TELEGRAM BOT RIGHTS: getChatMember ошибка:",
-                member_response.text[:300]
-            )
-            return False
-
-        result = member_data["result"]
-
-        log_line(
-            "TELEGRAM BOT RIGHTS:",
-            f"status={result.get('status')}",
-            f"can_post_messages={result.get('can_post_messages')}",
-            f"can_edit_messages={result.get('can_edit_messages')}",
-            f"can_delete_messages={result.get('can_delete_messages')}",
-            f"can_manage_chat={result.get('can_manage_chat')}",
-            f"can_pin_messages={result.get('can_pin_messages')}",
-        )
-
-        return True
-
-    except Exception as exc:
-        log_line(
-            "TELEGRAM BOT RIGHTS: ошибка проверки:",
-            exc
-        )
-        return False
 
 
 def update_services_post():
@@ -730,6 +726,8 @@ def update_services_post():
             or "message_id_invalid" in description
             or "400 client error" in description
         ):
+            old_id = message_id
+
             new_id = _send_services_post(text)
             save_id_file(
                 SERVICES_MESSAGE_ID_FILE,
@@ -737,10 +735,12 @@ def update_services_post():
             )
 
             log_line(
-                "СЕРВИСЫ: старый пост недоступен; создан новый",
-                f"message_id={new_id}"
+                "СЕРВИСЫ: старый текстовый пост заменён фото-постом",
+                f"old_message_id={old_id}",
+                f"new_message_id={new_id}"
             )
 
+            unpin_services_post(old_id)
             pin_services_post(new_id)
             return new_id
 
@@ -4855,6 +4855,9 @@ ECONOMY_NEWS_FIRST_RUN = True
 ARTS_CULTURE_NEWS_SEEN_FILE = state_file("arts_culture_news_seen.json")
 ARTS_CULTURE_NEWS_FIRST_RUN = True
 
+US_ELECTIONS_NEWS_SEEN_FILE = state_file("us_elections_news_seen.json")
+US_ELECTIONS_NEWS_FIRST_RUN = True
+
 SCIENCE_NEWS_SEEN_FILE = state_file("science_news_seen.json")
 SCIENCE_NEWS_FIRST_RUN = True
 
@@ -6725,6 +6728,16 @@ def check_telegram_commands(offset=None):
                     )
                 )
 
+            elif command == "/uselections":
+                published = check_us_elections_news()
+                send_private_reply(
+                    chat_id,
+                    (
+                        "Выборы в США проверены. "
+                        f"Опубликовано новых: {published}."
+                    )
+                )
+
             elif command == "/culture":
                 published = check_arts_culture_news()
 
@@ -8544,6 +8557,135 @@ def check_arts_culture_news():
         return 0
 
 
+US_ELECTION_KEYWORDS = (
+    "election",
+    "elections",
+    "electoral",
+    "vote",
+    "votes",
+    "voting",
+    "voter",
+    "voters",
+    "ballot",
+    "ballots",
+    "campaign",
+    "campaigns",
+    "candidate",
+    "candidates",
+    "primary",
+    "primaries",
+    "midterm",
+    "midterms",
+    "polling",
+    "polls",
+    "republican",
+    "republicans",
+    "democrat",
+    "democrats",
+)
+
+
+def _is_us_elections_item(item):
+    haystack = " ".join([
+        str(item.get("title", "")),
+        str(item.get("description", "")),
+    ]).lower()
+
+    return any(
+        keyword in haystack
+        for keyword in US_ELECTION_KEYWORDS
+    )
+
+
+def check_us_elections_news():
+    global US_ELECTIONS_NEWS_FIRST_RUN
+
+    label = "ВЫБОРЫ В США"
+    log_line(f"{label} NEWS: запуск проверки")
+
+    try:
+        items = _fetch_voa_category_news(
+            VOA_USA_RSS_URL,
+            label
+        )
+
+        items = [
+            item for item in items
+            if _is_us_elections_item(item)
+        ]
+
+        seen = _load_seen_simple_news(
+            US_ELECTIONS_NEWS_SEEN_FILE,
+            label
+        )
+
+        if US_ELECTIONS_NEWS_FIRST_RUN:
+            to_publish = items[:10]
+            log_line(
+                f"{label} NEWS: запуск сервера — публикую последние",
+                len(to_publish)
+            )
+        else:
+            to_publish = [
+                item for item in items
+                if item.get("url") not in seen
+            ]
+
+        published = 0
+
+        for index, item in enumerate(
+            reversed(to_publish),
+            start=1
+        ):
+            message = _make_voa_category_text(
+                item,
+                "🇺🇸 ВЫБОРЫ В США"
+            )
+
+            log_line(
+                f"{label} NEWS TELEGRAM:",
+                f"{len(message)}/4000 символов"
+            )
+
+            _send_voa_category_message(message)
+            published += 1
+
+            log_line(
+                f"{label} NEWS: опубликовано "
+                f"{index}/{len(to_publish)}:",
+                item.get("url", "")
+            )
+
+        for item in items:
+            if item.get("url"):
+                seen.add(item["url"])
+
+        _save_seen_simple_news(
+            US_ELECTIONS_NEWS_SEEN_FILE,
+            seen,
+            label
+        )
+
+        US_ELECTIONS_NEWS_FIRST_RUN = False
+
+        log_line(
+            f"{label} NEWS: опубликовано всего:",
+            published
+        )
+        log_line(
+            f"{label} NEWS: проверка завершена"
+        )
+
+        return published
+
+    except Exception as exc:
+        log_line(
+            f"{label} NEWS — ОШИБКА:",
+            exc
+        )
+        return 0
+
+
 # ЕДИНЫЙ ДИСПЕТЧЕР НОВОСТЕЙ
 # =========================================================
 # При запуске сервера выполняет стартовую проверку всех веток последовательно.
@@ -8621,6 +8763,293 @@ def start_news_dispatch(reason="по расписанию"):
     return True
 
 
+
+# =========================================================
+# КОНТЕНТ-ПАКЕТЫ ДЛЯ ОБНОВЛЕНИЙ НОВОСТНЫХ ЛЕНТ
+# =========================================================
+#
+# C:\ne_zaika_bot\
+#   nezaika\1.<любое расширение картинки>
+#   photos\1.<любое расширение картинки>
+#   stories\1.<любое расширение текста>
+#
+# Имя файла = только номер.
+# Расширение специально НЕ фиксируется.
+# Один номер связывает все три элемента.
+# =========================================================
+
+NEZAIKA_DIR = Path(BASE_DIR) / "nezaika"
+AI_PHOTOS_DIR = Path(BASE_DIR) / "photos"
+MINISTORY_DIR = Path(BASE_DIR) / "stories"
+
+CONTENT_PACK_STATE_FILE = state_file(
+    "content_pack_next_number.txt"
+)
+
+CONTENT_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp"
+}
+
+CONTENT_TEXT_EXTENSIONS = {
+    ".txt", ".md"
+}
+
+CONTENT_PACK_LOCK = threading.RLock()
+
+
+def _numbered_files(folder, allowed_extensions):
+    """
+    Возвращает:
+        {1: Path(...), 2: Path(...), ...}
+
+    Учитываются только файлы, у которых имя ДО точки —
+    целое положительное число: 1.png, 2.jpg, 17.webp и т.д.
+    """
+    result = {}
+
+    if not folder.exists():
+        return result
+
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+
+        if path.suffix.lower() not in allowed_extensions:
+            continue
+
+        if not path.stem.isdigit():
+            continue
+
+        number = int(path.stem)
+
+        if number <= 0:
+            continue
+
+        # Если случайно лежат 1.png и 1.jpg —
+        # берём первый найденный, но номер остаётся один.
+        result.setdefault(number, path)
+
+    return result
+
+
+def available_content_packs():
+    """
+    Возвращает только номера ПОЛНЫХ комплектов:
+      nezaika/N.*
+      photos/N.*
+      stories/N.*
+    """
+    nezaika = _numbered_files(
+        NEZAIKA_DIR,
+        CONTENT_IMAGE_EXTENSIONS
+    )
+    photos = _numbered_files(
+        AI_PHOTOS_DIR,
+        CONTENT_IMAGE_EXTENSIONS
+    )
+    stories = _numbered_files(
+        MINISTORY_DIR,
+        CONTENT_TEXT_EXTENSIONS
+    )
+
+    numbers = sorted(
+        set(nezaika)
+        & set(photos)
+        & set(stories)
+    )
+
+    return numbers, nezaika, photos, stories
+
+
+def load_next_content_number():
+    try:
+        value = Path(
+            CONTENT_PACK_STATE_FILE
+        ).read_text(
+            encoding="utf-8"
+        ).strip()
+
+        return int(value)
+
+    except Exception:
+        return None
+
+
+def save_next_content_number(number):
+    Path(
+        CONTENT_PACK_STATE_FILE
+    ).write_text(
+        str(number),
+        encoding="utf-8"
+    )
+
+
+def get_next_content_pack():
+    """
+    Берёт следующий полный комплект.
+    После последнего номера начинает снова с первого.
+
+    Если, например, есть 1, 2, 5 — порядок будет:
+    1 -> 2 -> 5 -> 1 ...
+    """
+    with CONTENT_PACK_LOCK:
+        numbers, nezaika, photos, stories = (
+            available_content_packs()
+        )
+
+        if not numbers:
+            return None
+
+        wanted = load_next_content_number()
+
+        if wanted in numbers:
+            number = wanted
+        else:
+            # Если сохранённого номера нет — берём первый
+            # существующий номер >= wanted, иначе первый вообще.
+            number = None
+
+            if wanted is not None:
+                for candidate in numbers:
+                    if candidate >= wanted:
+                        number = candidate
+                        break
+
+            if number is None:
+                number = numbers[0]
+
+        position = numbers.index(number)
+        next_number = numbers[
+            (position + 1) % len(numbers)
+        ]
+
+        save_next_content_number(
+            next_number
+        )
+
+        return {
+            "number": number,
+            "nezaika": nezaika[number],
+            "photo": photos[number],
+            "story": stories[number],
+        }
+
+
+def _telegram_send_photo_file(image_path, caption=None):
+    """
+    Отправляет локальную картинку в канал.
+    """
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendPhoto"
+    )
+
+    data = {
+        "chat_id": CHANNEL,
+    }
+
+    if caption:
+        data["caption"] = caption[:1024]
+
+    with image_path.open("rb") as image_file:
+        response = requests.post(
+            url,
+            data=data,
+            files={
+                "photo": (
+                    image_path.name,
+                    image_file
+                )
+            },
+            timeout=60,
+        )
+
+    response.raise_for_status()
+
+    body = response.json()
+
+    if not body.get("ok"):
+        raise RuntimeError(body)
+
+    return body["result"]["message_id"]
+
+
+def publish_content_pack(section_name):
+    """
+    Публикует три элемента ОДНОГО номера:
+
+      1. НеЗайка
+      2. ИИ-фото
+      3. МиниСТОРИ
+
+    Вызывается только если соответствующая новостная
+    лента действительно что-то опубликовала.
+    """
+    pack = get_next_content_pack()
+
+    if pack is None:
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            "полных комплектов не найдено"
+        )
+        return False
+
+    number = pack["number"]
+
+    try:
+        story_bytes = pack["story"].read_bytes()
+        story_text = None
+        for story_encoding in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                story_text = story_bytes.decode(story_encoding).strip()
+                break
+            except UnicodeDecodeError:
+                continue
+
+        if story_text is None:
+            story_text = story_bytes.decode("cp1251", errors="replace").strip()
+
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"комплект №{number} — публикация"
+        )
+
+        # 1. НеЗайка
+        _telegram_send_photo_file(
+            pack["nezaika"]
+        )
+
+        time.sleep(1.1)
+
+        # 2. ИИ-фото
+        _telegram_send_photo_file(
+            pack["photo"]
+        )
+
+        time.sleep(1.1)
+
+        # 3. МиниСТОРИ
+        if story_text:
+            send_message(
+                story_text
+            )
+
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"комплект №{number} опубликован"
+        )
+
+        return True
+
+    except Exception as exc:
+        log_line(
+            f"КОНТЕНТ / {section_name}: "
+            f"ОШИБКА комплекта №{number}:",
+            exc
+        )
+        return False
+
+
 def run_all_news_checks():
     sections = [
         ("ХАЙФА", check_haifa_news),
@@ -8633,6 +9062,7 @@ def run_all_news_checks():
         ("ЕВРОПА", check_europe_news),
         ("УКРАИНА", check_ukraine_news),
         ("США", check_usa_news),
+        ("ВЫБОРЫ В США", check_us_elections_news),
         ("ИРАН", check_iran_news),
         ("КИТАЙ", check_china_news),
         ("НАУКА И ЗДОРОВЬЕ", check_science_news),
@@ -8643,11 +9073,27 @@ def run_all_news_checks():
 
     for section_name, checker in sections:
         try:
-            log_line(f"NEWS DISPATCHER: {section_name} — запуск проверки")
-            checker()
-            log_line(f"NEWS DISPATCHER: {section_name} — проверка завершена")
+            log_line(
+                f"NEWS DISPATCHER: {section_name} — запуск проверки"
+            )
+
+            # Контент-пакет выходит ВСЕГДА и ДО проверки/выдачи новостей.
+            # Наличие новых публикаций на это больше не влияет.
+            publish_content_pack(
+                section_name
+            )
+
+            published = checker()
+
+            log_line(
+                f"NEWS DISPATCHER: {section_name} — проверка завершена"
+            )
+
         except Exception as exc:
-            log_line(f"NEWS DISPATCHER: {section_name} — ОШИБКА:", exc)
+            log_line(
+                f"NEWS DISPATCHER: {section_name} — ОШИБКА:",
+                exc
+            )
 
 
 def all_news_scheduler_loop():
@@ -8721,14 +9167,10 @@ def time_schedule_key(now):
 def main():
     telegram_offset = None
 
-    print(f"RUNNING FILE: {Path(__file__).resolve()}")
-
     log_line(
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
 
-
-    debug_bot_rights()
     # При запуске обновляем постоянные сервисные посты; новых простыней не создаём.
     try:
         update_weather()
@@ -8940,7 +9382,7 @@ def print_restart_command(reason="СЕРВЕР ОСТАНОВЛЕН"):
     print(reason)
     print()
     print("ПОВТОРНЫЙ ЗАПУСК:")
-    print(f"python {Path(__file__).name}")
+    print("python ne_zaika_bot.py")
     print("=" * 60)
 
 
