@@ -1,9 +1,10 @@
 # =========================================================
 # ХАЙФА: 15 РУБРИК × 3 ПОСЛЕДНИЕ НОВОСТИ БЕЗ УЧЕТА SEEN; 08/12/16/20
-# | 3.9.5
+# МИРОВЫЕ: единственный VOA-блок — русская VOA (Голос Америки); старые рубричные VOA/RSS-блоки удалены
+# | 3.10.0
 # =========================================================
 
-BOT_BUILD = "3.9.5-haifa-last3-per-category-20260831"
+BOT_BUILD = "3.10.0-russian-voa-world-clean-20260831"
 
 
 
@@ -5026,27 +5027,22 @@ def israel_news_scheduler_loop():
 
 
 # =========================================================
-# МИРОВЫЕ НОВОСТИ — GDELT DOC 2.0
+# МИРОВЫЕ НОВОСТИ — РУССКАЯ VOA / «ГОЛОС АМЕРИКИ»
+# =========================================================
+# 3.10.0:
+# - удалён старый источник voanews.com / Top Stories;
+# - старые RSS для блока «Мировые новости» не используются;
+# - единственный источник — русская VOA: golosameriki.com;
+# - заголовки уже на русском, дополнительный перевод не нужен;
+# - seen/state и существующая Telegram-логика сохранены.
 # =========================================================
 
-VOA_TOP_STORIES_URL = "https://www.voanews.com/"
-VOA_MIDDLE_EAST_RSS_URL = "https://www.voanews.com/api/zrbopl-vomx-tpeovm_"
-VOA_EUROPE_RSS_URL = "https://www.voanews.com/api/zjbovl-vomx-tpebvmr"
-VOA_UKRAINE_RSS_URL = "https://www.voanews.com/api/zt_rqyl-vomx-tpekboq_"
-VOA_USA_RSS_URL = "https://www.voanews.com/api/zqboml-vomx-tpeivmy"
-VOA_IRAN_RSS_URL = "https://www.voanews.com/api/zvgmqil-vomx-tpeumvqm"
-VOA_CHINA_RSS_URL = "https://www.voanews.com/api/zmjuqtl-vomx-tpey_jqq"
-VOA_SCIENCE_RSS_URL = "https://www.voanews.com/api/ztbopl-vomx-tpekvmm"
+VOA_RUSSIAN_URL = "https://www.golosameriki.com/"
 
-VOA_TECHNOLOGY_RSS_URL = "https://www.voanews.com/api/zyritl-vomx-tpettmq"
-VOA_ECONOMY_RSS_URL = "https://www.voanews.com/api/zyboql-vomx-tpetvmi"
-VOA_ARTS_CULTURE_RSS_URL = "https://www.voanews.com/api/zpbovl-vomx-tpe_vmr"
+# Остальные URL ниже относятся к САМОСТОЯТЕЛЬНЫМ рубрикам бота
+# (Ближний Восток, Европа, Украина, США и т. д.) и не участвуют
+# в блоке «МИРОВЫЕ НОВОСТИ».
 
-TECHNOLOGY_NEWS_SEEN_FILE = state_file("technology_news_seen.json")
-ECONOMY_NEWS_SEEN_FILE = state_file("economy_news_seen.json")
-ARTS_CULTURE_NEWS_SEEN_FILE = state_file("arts_culture_news_seen.json")
-US_ELECTIONS_NEWS_SEEN_FILE = state_file("us_elections_news_seen.json")
-SCIENCE_NEWS_SEEN_FILE = state_file("science_news_seen.json")
 CLIMATE_RSS_URL = "https://www.jpost.com/rss/rssenvironment"
 CLIMATE_NEWS_SEEN_FILE = state_file("climate_news_seen.json")
 SPORT_ISRAEL_RSS_URL = "https://www.jpost.com/rss/rssfeedssports.aspx"
@@ -5059,114 +5055,72 @@ ESPN_COLLEGE_BASKETBALL_RSS_URL = "https://www.espn.com/espn/rss/ncb/news"
 
 ESPN_SPORT_SEEN_FILE = state_file("espn_sport_seen.json")
 SPORT_NEWS_SEEN_FILE = state_file("sport_news_seen.json")
-CHINA_NEWS_SEEN_FILE = state_file(
-    "china_news_seen.json"
-)
-IRAN_NEWS_SEEN_FILE = state_file(
-    "iran_news_seen.json"
-)
-USA_NEWS_SEEN_FILE = state_file(
-    "usa_news_seen.json"
-)
-UKRAINE_NEWS_SEEN_FILE = state_file(
-    "ukraine_news_seen.json"
-)
-EUROPE_NEWS_SEEN_FILE = state_file(
-    "europe_news_seen.json"
-)
-MIDDLE_EAST_NEWS_SEEN_FILE = state_file(
-    "middle_east_news_seen.json"
-)
-WORLD_NEWS_SEEN_FILE = state_file(
-    "world_news_seen.json"
-)
-class VOATopStoriesParser(HTMLParser):
+WORLD_NEWS_SEEN_FILE = state_file("world_news_seen.json")
+
+
+class VOARussianNewsParser(HTMLParser):
+    """Собирает ссылки на материалы с русской главной VOA."""
+
     def __init__(self):
         super().__init__()
-
-        self.in_heading = False
-        self.heading_tag = ""
-        self.heading_parts = []
-
-        self.in_top_stories = False
-
+        self.items = []
         self.in_link = False
         self.link_href = ""
         self.link_parts = []
 
-        self.items = []
+    @staticmethod
+    def _is_article_href(href):
+        href = str(href or "").strip()
+        if not href:
+            return False
+
+        # Основной современный формат материалов Русской службы VOA.
+        return (
+            href.startswith("/a/")
+            or "golosameriki.com/a/" in href
+        )
 
     def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
+        if tag.lower() != "a":
+            return
 
-        if tag in ("h1", "h2", "h3"):
-            self.in_heading = True
-            self.heading_tag = tag
-            self.heading_parts = []
+        attrs_dict = dict(attrs)
+        href = str(attrs_dict.get("href") or "").strip()
 
-        if self.in_top_stories and tag == "a":
-            attrs_dict = dict(attrs)
-            href = str(
-                attrs_dict.get("href")
+        if self._is_article_href(href):
+            self.in_link = True
+            self.link_href = href
+            self.link_parts = []
+
+            # На некоторых карточках заголовок находится в title/aria-label.
+            fallback_title = (
+                attrs_dict.get("aria-label")
+                or attrs_dict.get("title")
                 or ""
-            ).strip()
-
-            if href:
-                self.in_link = True
-                self.link_href = href
-                self.link_parts = []
+            )
+            if fallback_title:
+                self.link_parts.append(str(fallback_title))
 
     def handle_data(self, data):
-        if self.in_heading:
-            self.heading_parts.append(data)
-
         if self.in_link:
             self.link_parts.append(data)
 
     def handle_endtag(self, tag):
-        tag = tag.lower()
+        if tag.lower() != "a" or not self.in_link:
+            return
 
-        if (
-            self.in_heading
-            and tag == self.heading_tag
-        ):
-            heading = clean_news_text(
-                " ".join(self.heading_parts)
-            )
+        title = clean_news_text(" ".join(self.link_parts))
+        href = self.link_href
 
-            if heading.lower() == "top stories":
-                self.in_top_stories = True
+        if title and href:
+            self.items.append({
+                "title": title,
+                "url": urljoin(VOA_RUSSIAN_URL, href),
+            })
 
-            elif self.in_top_stories:
-                # Следующий крупный раздел означает,
-                # что блок Top Stories закончился.
-                self.in_top_stories = False
-
-            self.in_heading = False
-            self.heading_tag = ""
-            self.heading_parts = []
-
-        if self.in_link and tag == "a":
-            title = clean_news_text(
-                " ".join(self.link_parts)
-            )
-
-            href = self.link_href
-
-            if title and href:
-                self.items.append(
-                    {
-                        "title": title,
-                        "url": urljoin(
-                            VOA_TOP_STORIES_URL,
-                            href
-                        ),
-                    }
-                )
-
-            self.in_link = False
-            self.link_href = ""
-            self.link_parts = []
+        self.in_link = False
+        self.link_href = ""
+        self.link_parts = []
 
 
 def load_seen_world_news():
@@ -5216,7 +5170,7 @@ def save_seen_world_news(seen):
 
 def fetch_world_news():
     response = requests.get(
-        VOA_TOP_STORIES_URL,
+        VOA_RUSSIAN_URL,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 "
@@ -5229,13 +5183,15 @@ def fetch_world_news():
                 "text/html,application/xhtml+xml,"
                 "application/xml;q=0.9,*/*;q=0.8"
             ),
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
         },
         timeout=30,
     )
 
     response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
 
-    parser = VOATopStoriesParser()
+    parser = VOARussianNewsParser()
     parser.feed(response.text)
 
     items = []
@@ -5243,36 +5199,24 @@ def fetch_world_news():
     seen_titles = set()
 
     for item in parser.items:
-        title = clean_news_text(
-            item.get("title")
-        )
-
-        url = str(
-            item.get("url")
-            or ""
-        ).strip()
+        title = clean_news_text(item.get("title"))
+        url = str(item.get("url") or "").strip()
 
         if (
             not title
-            or not url.startswith(
-                "https://www.voanews.com/"
-            )
+            or not url.startswith("https://www.golosameriki.com/a/")
         ):
             continue
 
-        # Отбрасываем навигационные ссылки.
-        if title.lower() in {
-            "top stories",
-            "more",
-            "more from voa",
-            "breaking news",
-        }:
+        # Убираем служебные и слишком короткие подписи карточек.
+        if len(title) < 12:
             continue
 
         normalized_title = re.sub(
-            r"[^a-z0-9]+",
+            r"[^0-9a-zа-яё]+",
             " ",
-            title.lower()
+            title.lower(),
+            flags=re.IGNORECASE,
         ).strip()
 
         if (
@@ -5285,40 +5229,33 @@ def fetch_world_news():
             continue
 
         seen_urls.add(url)
-
         if normalized_title:
-            seen_titles.add(
-                normalized_title
-            )
+            seen_titles.add(normalized_title)
 
-        items.append(
-            {
-                "title": title,
-                "url": url,
-                "domain": "Voice of America",
-            }
-        )
+        items.append({
+            "title": title,
+            "url": url,
+            "domain": "Голос Америки",
+        })
 
     log_line(
-        "WORLD NEWS / VOA TOP STORIES: найдено:",
+        "WORLD NEWS / ГОЛОС АМЕРИКИ RU: найдено:",
         len(items)
     )
 
     if not items:
         raise RuntimeError(
-            "VOA Top Stories не найдены "
-            "на главной странице"
+            "Русская VOA / Голос Америки не вернула новости"
         )
 
     return items
 
-def make_world_news_text(item):
-    title_ru = translate_news_to_ru(
-        item.get("title", ""),
-        "en"
-    )
 
-    safe_title = html.escape(title_ru)
+def make_world_news_text(item):
+    # Источник уже русскоязычный — перевод не нужен.
+    safe_title = html.escape(
+        clean_news_text(item.get("title", ""))
+    )
 
     safe_url = html.escape(
         item.get("url", ""),
@@ -5328,10 +5265,11 @@ def make_world_news_text(item):
     return (
         "🌍 МИРОВЫЕ НОВОСТИ\n\n"
         f"{safe_title}\n\n"
-        "Source: Voice of America\n"
+        "Источник: Голос Америки\n"
         f'<a href="{safe_url}">Оригинал</a>\n\n'
         "@ne_zaika"
     )
+
 
 def send_world_news_message(text):
     safe_text, truncated = _truncate_telegram_text(text)
@@ -5365,9 +5303,7 @@ def check_world_news():
     items = fetch_world_news()
 
     if not items:
-        log_line(
-            "WORLD NEWS: публикаций не найдено"
-        )
+        log_line("WORLD NEWS: публикаций не найдено")
         return 0
 
     seen = load_seen_world_news()
@@ -5426,1119 +5362,78 @@ def check_world_news():
 
 
 
-def load_seen_middle_east_news():
-    if not os.path.exists(MIDDLE_EAST_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            MIDDLE_EAST_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "БЛИЖНИЙ ВОСТОК NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_middle_east_news(seen):
-    try:
-        with open(
-            MIDDLE_EAST_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "БЛИЖНИЙ ВОСТОК NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_middle_east_news():
-    response = requests.get(
-        VOA_MIDDLE_EAST_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("БЛИЖНИЙ ВОСТОК / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA Middle East RSS не вернул новости")
-
-    return items
-
-
-def make_middle_east_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 БЛИЖНИЙ ВОСТОК", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
 
 
 
-def send_middle_east_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
 
-    print(
-        "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
 
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
 
-    response.raise_for_status()
 
-    result = response.json()
 
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
 
-    print(
-        "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
 
-    return message_id
-
-
-def check_middle_east_news():
-    log_line("БЛИЖНИЙ ВОСТОК NEWS: запуск проверки")
 
-    try:
-        items = fetch_middle_east_news()
-        seen = load_seen_middle_east_news()
 
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_middle_east_news_text(item)
-
-            print(
-                "БЛИЖНИЙ ВОСТОК NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_middle_east_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"БЛИЖНИЙ ВОСТОК NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_middle_east_news(seen)
-
-        log_line(
-            "БЛИЖНИЙ ВОСТОК NEWS: опубликовано всего:",
-            published
-        )
-        log_line("БЛИЖНИЙ ВОСТОК NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("БЛИЖНИЙ ВОСТОК NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def middle_east_news_scheduler_loop():
-    check_middle_east_news()
-
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-        log_line(
-            "БЛИЖНИЙ ВОСТОК NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
-
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
-
-        check_middle_east_news()
-
-
-def load_seen_europe_news():
-    if not os.path.exists(EUROPE_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            EUROPE_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "ЕВРОПА NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_europe_news(seen):
-    try:
-        with open(
-            EUROPE_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "ЕВРОПА NEWS — ошибка записи state:",
-            error
-        )
-
 
-def fetch_europe_news():
-    response = requests.get(
-        VOA_EUROPE_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
 
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
 
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
 
-    log_line("ЕВРОПА / VOA: найдено:", len(items))
 
-    if not items:
-        raise RuntimeError("VOA Europe RSS не вернул новости")
-
-    return items
 
-
-def make_europe_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 ЕВРОПА", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
 
-    return "\n".join(parts)
 
-
-
-def send_europe_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "ЕВРОПА NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "ЕВРОПА NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
-
-
-def check_europe_news():
-    log_line("ЕВРОПА NEWS: запуск проверки")
-
-    try:
-        items = fetch_europe_news()
-        seen = load_seen_europe_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_europe_news_text(item)
-
-            print(
-                "ЕВРОПА NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_europe_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"ЕВРОПА NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_europe_news(seen)
-
-        log_line(
-            "ЕВРОПА NEWS: опубликовано всего:",
-            published
-        )
-        log_line("ЕВРОПА NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("ЕВРОПА NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def europe_news_scheduler_loop():
-    check_europe_news()
-
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-        log_line(
-            "ЕВРОПА NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
-
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
-
-        check_europe_news()
-
-
-def load_seen_ukraine_news():
-    if not os.path.exists(UKRAINE_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            UKRAINE_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "УКРАИНА NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_ukraine_news(seen):
-    try:
-        with open(
-            UKRAINE_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "УКРАИНА NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_ukraine_news():
-    response = requests.get(
-        VOA_UKRAINE_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("УКРАИНА / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA Ukraine RSS не вернул новости")
-
-    return items
-
-
-def make_ukraine_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 УКРАИНА", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
-
-
-
-def send_ukraine_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "УКРАИНА NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "УКРАИНА NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
-
-
-def check_ukraine_news():
-    log_line("УКРАИНА NEWS: запуск проверки")
-
-    try:
-        items = fetch_ukraine_news()
-        seen = load_seen_ukraine_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_ukraine_news_text(item)
-
-            print(
-                "УКРАИНА NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_ukraine_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"УКРАИНА NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_ukraine_news(seen)
-
-        log_line(
-            "УКРАИНА NEWS: опубликовано всего:",
-            published
-        )
-        log_line("УКРАИНА NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("УКРАИНА NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def ukraine_news_scheduler_loop():
-    check_ukraine_news()
-
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-        log_line(
-            "УКРАИНА NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
-
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
-
-        check_ukraine_news()
-
-
-def load_seen_usa_news():
-    if not os.path.exists(USA_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            USA_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "США NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_usa_news(seen):
-    try:
-        with open(
-            USA_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "США NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_usa_news():
-    response = requests.get(
-        VOA_USA_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("США / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA USA RSS не вернул новости")
-
-    return items
-
-
-def make_usa_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 США", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
-
-
-
-def send_usa_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "США NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "США NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
-
-
-def check_usa_news():
-    log_line("США NEWS: запуск проверки")
-
-    try:
-        items = fetch_usa_news()
-        seen = load_seen_usa_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_usa_news_text(item)
-
-            print(
-                "США NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_usa_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"США NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_usa_news(seen)
-
-        log_line(
-            "США NEWS: опубликовано всего:",
-            published
-        )
-        log_line("США NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("США NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def usa_news_scheduler_loop():
-    check_usa_news()
-
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-        log_line(
-            "США NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
-
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
-
-        check_usa_news()
-
-
-def load_seen_iran_news():
-    if not os.path.exists(IRAN_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            IRAN_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "ИРАН NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_iran_news(seen):
-    try:
-        with open(
-            IRAN_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "ИРАН NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_iran_news():
-    response = requests.get(
-        VOA_IRAN_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("ИРАН / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA Iran RSS не вернул новости")
-
-    return items
-
-
-def make_iran_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 ИРАН", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
-
-
-
-def send_iran_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "ИРАН NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "ИРАН NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
-
-
-def check_iran_news():
-    log_line("ИРАН NEWS: запуск проверки")
-
-    try:
-        items = fetch_iran_news()
-        seen = load_seen_iran_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_iran_news_text(item)
-
-            print(
-                "ИРАН NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_iran_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"ИРАН NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_iran_news(seen)
-
-        log_line(
-            "ИРАН NEWS: опубликовано всего:",
-            published
-        )
-        log_line("ИРАН NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("ИРАН NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def iran_news_scheduler_loop():
-    check_iran_news()
-
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-        log_line(
-            "ИРАН NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
-
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
-
-        check_iran_news()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def world_news_scheduler_loop():
@@ -6710,180 +5605,6 @@ def check_telegram_commands(offset=None):
                     f"Новости Хайфы проверены. Опубликовано новых: {published}."
                 )
 
-            elif command == "/middleeast":
-                published = check_middle_east_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ближнего Востока проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/europe":
-                published = check_europe_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Европы проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/ukraine":
-                published = check_ukraine_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Украины проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/usa":
-                published = check_usa_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости США проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/iran":
-                published = check_iran_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ирана проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/china":
-                published = check_china_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Китая проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/science":
-                published = check_science_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Наука и здоровье проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/climate":
-                published = check_climate_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Климат проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/espn":
-                published = check_espn_sport()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "ESPN Sport проверен. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/sport":
-                published = check_sport_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Спорт проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/technology":
-                published = check_technology_news()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Технологии VOA проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/economy":
-                published = check_economy_news()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Экономика VOA проверена. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/uselections":
-                published = check_us_elections_news()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Выборы в США проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/culture":
-                published = check_arts_culture_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Arts & Culture VOA проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/worldnews":
-                published = check_world_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Мировые новости проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/israelnews":
-                published = check_israel_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Израиля проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/rates":
-                rates_message_id = update_rates()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Курсы обновлены. "
-                        f"Пост #{rates_message_id}. "
-                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
-                    )
-                )
 
         except Exception as error:
             print(
@@ -6954,454 +5675,38 @@ def next_flights_run(now=None):
 
 
 # =========================================================
-def load_seen_china_news():
-    if not os.path.exists(CHINA_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            CHINA_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "КИТАЙ NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_china_news(seen):
-    try:
-        with open(
-            CHINA_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "КИТАЙ NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_china_news():
-    response = requests.get(
-        VOA_CHINA_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("КИТАЙ / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA China RSS не вернул новости")
-
-    return items
-
-
-def make_china_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 КИТАЙ", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
 
 
 
-def send_china_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "КИТАЙ NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "КИТАЙ NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
 
 
-def check_china_news():
-    log_line("КИТАЙ NEWS: запуск проверки")
-
-    try:
-        items = fetch_china_news()
-        seen = load_seen_china_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_china_news_text(item)
-
-            print(
-                "КИТАЙ NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_china_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"КИТАЙ NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_china_news(seen)
-
-        log_line(
-            "КИТАЙ NEWS: опубликовано всего:",
-            published
-        )
-        log_line("КИТАЙ NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("КИТАЙ NEWS — ОШИБКА:", exc)
-        return 0
 
 
-def china_news_scheduler_loop():
-    check_china_news()
 
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
 
-        log_line(
-            "КИТАЙ NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
 
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
 
-        check_china_news()
+
+
 
 
 
 
 
 # =========================================================
-def load_seen_science_news():
-    if not os.path.exists(SCIENCE_NEWS_SEEN_FILE):
-        return set()
-
-    try:
-        with open(
-            SCIENCE_NEWS_SEEN_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        log_line(
-            "НАУКА И ЗДОРОВЬЕ NEWS — ошибка state:",
-            error
-        )
-
-    return set()
-
-
-def save_seen_science_news(seen):
-    try:
-        with open(
-            SCIENCE_NEWS_SEEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                list(seen)[-5000:],
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-    except Exception as error:
-        log_line(
-            "НАУКА И ЗДОРОВЬЕ NEWS — ошибка записи state:",
-            error
-        )
-
-
-def fetch_science_news():
-    response = requests.get(
-        VOA_SCIENCE_RSS_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    root = ET.fromstring(response.content)
-    items = []
-
-    for node in root.findall(".//item"):
-        title = clean_news_text(node.findtext("title") or "")
-        url = str(node.findtext("link") or "").strip()
-        description = clean_news_text(node.findtext("description") or "")
-
-        if title and url:
-            items.append({
-                "title": title,
-                "url": url,
-                "description": description,
-            })
-
-    log_line("НАУКА И ЗДОРОВЬЕ / VOA: найдено:", len(items))
-
-    if not items:
-        raise RuntimeError("VOA Science & Health RSS не вернул новости")
-
-    return items
-
-
-def make_science_news_text(item):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = ["🌍 НАУКА И ЗДОРОВЬЕ", "", safe_title]
-
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: Voice of America",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-
-    return "\n".join(parts)
 
 
 
-def send_science_news_message(text):
-    safe_text, truncated = (
-        _truncate_telegram_text(
-            text
-        )
-    )
-
-    print(
-        "НАУКА И ЗДОРОВЬЕ NEWS TELEGRAM:",
-        f"{len(safe_text)}/{TELEGRAM_TEXT_LIMIT} символов",
-        "(ОБРЕЗАНО)" if truncated else ""
-    )
-
-    response = _telegram_send_post(
-        data={
-            "chat_id": CHANNEL,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result)
-
-    message_id = result["result"]["message_id"]
-
-    print(
-        "НАУКА И ЗДОРОВЬЕ NEWS TELEGRAM: OK",
-        f"message_id={message_id}"
-    )
-
-    return message_id
 
 
-def check_science_news():
-    log_line("НАУКА И ЗДОРОВЬЕ NEWS: запуск проверки")
-
-    try:
-        items = fetch_science_news()
-        seen = load_seen_science_news()
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = make_science_news_text(item)
-
-            print(
-                "НАУКА И ЗДОРОВЬЕ NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            send_science_news_message(
-                message
-            )
-
-            published += 1
-            print(
-                f"НАУКА И ЗДОРОВЬЕ NEWS: опубликовано "
-                f"{index}/{len(to_publish)}: {item.get('url', '')}"
-            )
-
-        for item in items:
-            url = item.get("url")
-            if url:
-                seen.add(url)
-
-        save_seen_science_news(seen)
-
-        log_line(
-            "НАУКА И ЗДОРОВЬЕ NEWS: опубликовано всего:",
-            published
-        )
-        log_line("НАУКА И ЗДОРОВЬЕ NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line("НАУКА И ЗДОРОВЬЕ NEWS — ОШИБКА:", exc)
-        return 0
 
 
-def science_news_scheduler_loop():
-    check_science_news()
 
-    while True:
-        now = datetime.now()
-        next_run = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
 
-        log_line(
-            "НАУКА И ЗДОРОВЬЕ NEWS: следующее обновление",
-            next_run.strftime("%d.%m.%Y %H:%M:%S")
-        )
 
-        seconds = max(
-            1,
-            (next_run - datetime.now()).total_seconds()
-        )
-        time.sleep(seconds)
 
-        check_science_news()
+
+
 
 
 
@@ -7797,303 +6102,23 @@ def _save_seen_simple_news(path_value, seen, label):
         log_line(f"{label} NEWS: ошибка записи state:", exc)
 
 
-def _fetch_voa_category_news(feed_url, label):
-    items = _fetch_rss_items(feed_url, "VOA", label)
-    log_line(f"{label} / VOA: найдено:", len(items))
-    if not items:
-        raise RuntimeError(f"VOA {label} RSS не вернул новости")
-    return items
-
-
-def _make_voa_category_text(item, header):
-    title_ru = translate_news_to_ru(item.get("title", ""), "en")
-    description_ru = translate_news_to_ru(item.get("description", ""), "en")
-
-    safe_title = html.escape(title_ru)
-    safe_description = html.escape(description_ru)
-    safe_url = html.escape(item.get("url", ""), quote=True)
-
-    parts = [header, "", safe_title]
-    if safe_description:
-        parts += ["", safe_description]
-
-    parts += [
-        "",
-        "Source: VOA",
-        f'<a href="{safe_url}">Оригинал</a>',
-        "",
-        "@ne_zaika",
-    ]
-    return "\n".join(parts)
-
-
-def _send_voa_category_message(text):
-    return _telegram_send_post({
-        "chat_id": CHANNEL,
-        "text": text[:4000],
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    })
-
-
-def check_technology_news():
-    label = "ТЕХНОЛОГИИ"
-    log_line(f"{label} NEWS: запуск проверки")
-
-    try:
-        items = _fetch_voa_category_news(VOA_TECHNOLOGY_RSS_URL, label)
-        seen = _load_seen_simple_news(TECHNOLOGY_NEWS_SEEN_FILE, label)
-
-        to_publish = [item for item in items if item.get("url") not in seen]
-
-        published = 0
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = _make_voa_category_text(item, "💻 ТЕХНОЛОГИИ")
-            log_line(f"{label} NEWS TELEGRAM:", f"{len(message)}/4000 символов")
-            _send_voa_category_message(message)
-            published += 1
-            log_line(
-                f"{label} NEWS: опубликовано {index}/{len(to_publish)}:",
-                item.get("url", "")
-            )
-
-        for item in items:
-            if item.get("url"):
-                seen.add(item["url"])
-
-        _save_seen_simple_news(TECHNOLOGY_NEWS_SEEN_FILE, seen, label)
-        log_line(f"{label} NEWS: опубликовано всего:", published)
-        log_line(f"{label} NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line(f"{label} NEWS — ОШИБКА:", exc)
-        return 0
-
-
-def check_economy_news():
-    label = "ЭКОНОМИКА"
-    log_line(f"{label} NEWS: запуск проверки")
-
-    try:
-        items = _fetch_voa_category_news(VOA_ECONOMY_RSS_URL, label)
-        seen = _load_seen_simple_news(ECONOMY_NEWS_SEEN_FILE, label)
-
-        to_publish = [item for item in items if item.get("url") not in seen]
-
-        published = 0
-        for index, item in enumerate(reversed(to_publish), start=1):
-            message = _make_voa_category_text(item, "💰 ЭКОНОМИКА")
-            log_line(f"{label} NEWS TELEGRAM:", f"{len(message)}/4000 символов")
-            _send_voa_category_message(message)
-            published += 1
-            log_line(
-                f"{label} NEWS: опубликовано {index}/{len(to_publish)}:",
-                item.get("url", "")
-            )
-
-        for item in items:
-            if item.get("url"):
-                seen.add(item["url"])
-
-        _save_seen_simple_news(ECONOMY_NEWS_SEEN_FILE, seen, label)
-        log_line(f"{label} NEWS: опубликовано всего:", published)
-        log_line(f"{label} NEWS: проверка завершена")
-        return published
-
-    except Exception as exc:
-        log_line(f"{label} NEWS — ОШИБКА:", exc)
-        return 0
 
 
 
-def check_arts_culture_news():
-    label = "КУЛЬТУРА"
-    log_line(f"{label} NEWS: запуск проверки")
-
-    try:
-        items = _fetch_voa_category_news(
-            VOA_ARTS_CULTURE_RSS_URL,
-            "ARTS & CULTURE"
-        )
-        seen = _load_seen_simple_news(
-            ARTS_CULTURE_NEWS_SEEN_FILE,
-            label
-        )
-
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
-
-        published = 0
-
-        for index, item in enumerate(
-            reversed(to_publish),
-            start=1
-        ):
-            message = _make_voa_category_text(
-                item,
-                "🎭 КУЛЬТУРА"
-            )
-
-            log_line(
-                f"{label} NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
-
-            _send_voa_category_message(message)
-
-            published += 1
-
-            log_line(
-                f"{label} NEWS: опубликовано "
-                f"{index}/{len(to_publish)}:",
-                item.get("url", "")
-            )
-
-        for item in items:
-            if item.get("url"):
-                seen.add(item["url"])
-
-        _save_seen_simple_news(
-            ARTS_CULTURE_NEWS_SEEN_FILE,
-            seen,
-            label
-        )
-        log_line(
-            f"{label} NEWS: опубликовано всего:",
-            published
-        )
-        log_line(
-            f"{label} NEWS: проверка завершена"
-        )
-
-        return published
-
-    except Exception as exc:
-        log_line(
-            f"{label} NEWS — ОШИБКА:",
-            exc
-        )
-        return 0
 
 
-US_ELECTION_KEYWORDS = (
-    "election",
-    "elections",
-    "electoral",
-    "vote",
-    "votes",
-    "voting",
-    "voter",
-    "voters",
-    "ballot",
-    "ballots",
-    "campaign",
-    "campaigns",
-    "candidate",
-    "candidates",
-    "primary",
-    "primaries",
-    "midterm",
-    "midterms",
-    "polling",
-    "polls",
-    "republican",
-    "republicans",
-    "democrat",
-    "democrats",
-)
 
 
-def _is_us_elections_item(item):
-    haystack = " ".join([
-        str(item.get("title", "")),
-        str(item.get("description", "")),
-    ]).lower()
-
-    return any(
-        keyword in haystack
-        for keyword in US_ELECTION_KEYWORDS
-    )
 
 
-def check_us_elections_news():
-    label = "ВЫБОРЫ В США"
-    log_line(f"{label} NEWS: запуск проверки")
 
-    try:
-        items = _fetch_voa_category_news(
-            VOA_USA_RSS_URL,
-            label
-        )
 
-        items = [
-            item for item in items
-            if _is_us_elections_item(item)
-        ]
 
-        seen = _load_seen_simple_news(
-            US_ELECTIONS_NEWS_SEEN_FILE,
-            label
-        )
 
-        to_publish = [
-            item for item in items
-            if item.get("url") not in seen
-        ]
 
-        published = 0
 
-        for index, item in enumerate(
-            reversed(to_publish),
-            start=1
-        ):
-            message = _make_voa_category_text(
-                item,
-                "🇺🇸 ВЫБОРЫ В США"
-            )
 
-            log_line(
-                f"{label} NEWS TELEGRAM:",
-                f"{len(message)}/4000 символов"
-            )
 
-            _send_voa_category_message(message)
-            published += 1
-
-            log_line(
-                f"{label} NEWS: опубликовано "
-                f"{index}/{len(to_publish)}:",
-                item.get("url", "")
-            )
-
-        for item in items:
-            if item.get("url"):
-                seen.add(item["url"])
-
-        _save_seen_simple_news(
-            US_ELECTIONS_NEWS_SEEN_FILE,
-            seen,
-            label
-        )
-        log_line(
-            f"{label} NEWS: опубликовано всего:",
-            published
-        )
-        log_line(
-            f"{label} NEWS: проверка завершена"
-        )
-
-        return published
-
-    except Exception as exc:
-        log_line(
-            f"{label} NEWS — ОШИБКА:",
-            exc
-        )
-        return 0
 
 
 # ЕДИНЫЙ ДИСПЕТЧЕР НОВОСТЕЙ
@@ -8457,11 +6482,11 @@ CONTENT_PACK_TELEGRAM_COMMANDS = {
     "/time",
     "/flights",
     "/news",
-    "/middleeast",
-    "/europe",
-    "/ukraine",
-    "/usa",
-    "/iran",
+
+
+
+
+
     "/worldnews",
     "/israelnews",
     "/rates",
@@ -8472,17 +6497,17 @@ def run_all_news_checks():
     sections = [
         ("ИЗРАИЛЬ", check_israel_news),
         ("WORLD", check_world_news),
-        ("ТЕХНОЛОГИИ", check_technology_news),
-        ("ЭКОНОМИКА", check_economy_news),
-        ("КУЛЬТУРА", check_arts_culture_news),
-        ("БЛИЖНИЙ ВОСТОК", check_middle_east_news),
-        ("ЕВРОПА", check_europe_news),
-        ("УКРАИНА", check_ukraine_news),
-        ("США", check_usa_news),
-        ("ВЫБОРЫ В США", check_us_elections_news),
-        ("ИРАН", check_iran_news),
-        ("КИТАЙ", check_china_news),
-        ("НАУКА И ЗДОРОВЬЕ", check_science_news),
+
+
+
+
+
+
+
+
+
+
+
         ("КЛИМАТ", check_climate_news),
         ("СПОРТ ИЗРАИЛЯ", check_sport_news),
         ("ESPN SPORT", check_espn_sport),
