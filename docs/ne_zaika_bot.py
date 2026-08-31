@@ -1,10 +1,10 @@
 # =========================================================
-# ХАЙФА: 15 РУБРИК × 3 ПОСЛЕДНИЕ НОВОСТИ БЕЗ УЧЕТА SEEN; 08/12/16/20
+# ХАЙФА: публикуются только новые новости по seen; 08/12/16/20
 # МИРОВЫЕ: единственный VOA-блок — русская VOA (Голос Америки); старые рубричные VOA/RSS-блоки удалены
-# | 3.10.0
+# | 3.10.1
 # =========================================================
 
-BOT_BUILD = "3.10.0-russian-voa-world-clean-20260831"
+BOT_BUILD = "3.10.1-haifa-new-only-20260831"
 
 
 
@@ -4180,7 +4180,6 @@ def fetch_haifa_news_links():
     seen_links = set()
     successful_sources = 0
     failed_sources = []
-    source_links_map = {}
 
     for source_name, page_url in HAIFA_NEWS_SOURCES:
         try:
@@ -4198,7 +4197,6 @@ def fetch_haifa_news_links():
             parser.feed(response.text)
 
             source_links = list(parser.links)
-            source_links_map[source_name] = source_links
             added = 0
             for url in source_links:
                 if url not in seen_links:
@@ -4234,7 +4232,7 @@ def fetch_haifa_news_links():
         f"уникальных_URL={len(links)}",
     )
 
-    return links, successful_sources, failed_sources, source_links_map
+    return links, successful_sources, failed_sources
 
 
 def fetch_haifa_article_title(url):
@@ -4411,79 +4409,15 @@ def send_haifa_news_message(text):
     return result["result"]["message_id"]
 
 
-def publish_haifa_latest_three_per_category(source_links_map, seen):
-    """
-    Публикует по три верхние (самые свежие) статьи из каждой из 15 рубрик.
-    Главная страница не считается рубрикой. Проверка seen намеренно не применяется.
-    После успешной отправки URL всё равно сохраняется в seen, чтобы обычная
-    логика новых публикаций в том же цикле не отправила эту статью повторно.
-    """
-    published = 0
-
-    for source_name, _page_url in HAIFA_NEWS_SOURCES[1:]:
-        source_links = source_links_map.get(source_name, [])
-        latest_three = source_links[:3]
-
-        print(
-            "ХАЙФА NEWS LAST3:",
-            source_name,
-            f"к_публикации={len(latest_three)}",
-        )
-
-        for position, url in enumerate(latest_three, start=1):
-            try:
-                title = fetch_haifa_article_title(url)
-                send_haifa_news_message(
-                    make_haifa_news_text(
-                        title,
-                        url,
-                        rubric_name=source_name,
-                    )
-                )
-
-                seen.add(url)
-                save_seen_haifa_news(seen)
-                published += 1
-
-                print(
-                    "ХАЙФА NEWS LAST3: опубликовано",
-                    source_name,
-                    f"{position}/{len(latest_three)}:",
-                    url,
-                )
-
-                time.sleep(1.1)
-
-            except Exception as error:
-                print(
-                    "ХАЙФА NEWS LAST3 — ОШИБКА СТАТЬИ:",
-                    source_name,
-                    url,
-                    error,
-                )
-
-    log_line(
-        "ХАЙФА NEWS LAST3: опубликовано всего:",
-        published
-    )
-    return published
-
-
 def check_haifa_news():
-    links, successful_sources, failed_sources, source_links_map = fetch_haifa_news_links()
+    links, successful_sources, failed_sources = fetch_haifa_news_links()
     print("ХАЙФА NEWS: найдено уникальных ссылок:", len(links))
+
     seen = load_seen_haifa_news()
     if seen is None:
         seen = set()
 
-    # Отдельно и без учета seen публикуем 3 самые свежие статьи
-    # из каждой из 15 тематических рубрик.
-    forced_published = publish_haifa_latest_three_per_category(
-        source_links_map,
-        seen,
-    )
-
-    # Существующая baseline-логика оставлена без изменения.
+    # Первый запуск только создаёт базу текущих URL и ничего не публикует.
     if not haifa_news_baseline_ready():
         if successful_sources != len(HAIFA_NEWS_SOURCES):
             raise RuntimeError(
@@ -4496,22 +4430,19 @@ def check_haifa_news():
         save_haifa_news_baseline()
         print(
             "ХАЙФА NEWS: создана первичная база 16 источников; "
-            f"URL в seen={len(seen)}; обычных публикаций=0; "
-            f"LAST3 публикаций={forced_published}"
+            f"URL в seen={len(seen)}; публикаций=0"
         )
-        return forced_published
+        return 0
 
+    # Публикуем только URL, которых ещё нет в seen.
     new_links = [
         url for url in links
         if url not in seen
     ]
 
     if not new_links:
-        print(
-            "ХАЙФА NEWS: новых обычных публикаций нет; "
-            f"LAST3 публикаций={forced_published}"
-        )
-        return forced_published
+        print("ХАЙФА NEWS: новых публикаций нет")
+        return 0
 
     # Лента обычно идёт от новых к старым.
     # Публикуем от старых к новым, чтобы самая свежая
@@ -4520,7 +4451,7 @@ def check_haifa_news():
     published = 0
 
     print(
-        "ХАЙФА NEWS: обычных новых к публикации:",
+        "ХАЙФА NEWS: новых к публикации:",
         len(new_links)
     )
 
@@ -4554,15 +4485,12 @@ def check_haifa_news():
                 error
             )
 
-    total_published = forced_published + published
     log_line(
         "ХАЙФА NEWS: опубликовано всего:",
-        total_published,
-        f"(LAST3={forced_published}, новых={published})"
+        published
     )
 
-    return total_published
-
+    return published
 
 
 # =========================================================
