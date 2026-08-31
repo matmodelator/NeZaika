@@ -1,6 +1,6 @@
 # =========================================================
-# КОНТЕНТ-ПАКЕТ ПРИ КАЖДОМ ОБНОВЛЕНИИ; MM.DD; nezaika FALLBACK НА МИНИМАЛЬНЫЙ НОМЕР
-# | 3.8.13
+# УНИКАЛЬНОСТЬ НОВОСТЕЙ ПО ЛОКАЛЬНЫМ *_seen.json; КОНТЕНТ-ПАКЕТ ПРИ КАЖДОМ ОБНОВЛЕНИИ; MM.DD - только 1 раз!
+# | 3.9.1
 # =========================================================
 
 
@@ -1804,9 +1804,6 @@ def update_weather(force_new=False):
 
     safe_update_services_post()
 
-    # Контент-пакет обновляется при КАЖДОМ обновлении погоды.
-    publish_content_pack("ПОГОДА")
-
     return message_id
 
 
@@ -3569,9 +3566,6 @@ def update_flight_board():
 
     safe_update_services_post()
 
-    # Контент-пакет обновляется при КАЖДОМ обновлении табло рейсов.
-    publish_content_pack("БЕН-ГУРИОН")
-
     return message_ids
 
 
@@ -3910,9 +3904,6 @@ def update_rates():
 
     safe_update_services_post()
 
-    # Контент-пакет обновляется при КАЖДОМ обновлении валют.
-    publish_content_pack("ВАЛЮТЫ")
-
     return message_id
 
 
@@ -4065,9 +4056,6 @@ def update_time_post():
 
     safe_update_services_post()
 
-    # Контент-пакет обновляется при КАЖДОМ обновлении мирового времени.
-    publish_content_pack("МИРОВОЕ ВРЕМЯ")
-
     return message_id
 
 
@@ -4084,9 +4072,6 @@ HAIFA_NEWS_URL = "https://www.haifa.muni.il/haifa-news/"
 HAIFA_NEWS_INTERVAL = 60 * 60
 HAIFA_NEWS_SEEN_FILE = state_file("haifa_news_seen_v3.json")
 HAIFA_NEWS_TRANSLATION_CACHE_FILE = state_file("haifa_news_translation_cache.json")
-HAIFA_NEWS_FIRST_RUN = True
-
-
 class HaifaNewsLinksParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -4343,28 +4328,15 @@ def send_haifa_news_message(text):
 def check_haifa_news():
     links = fetch_haifa_news_links()
     print("ХАЙФА NEWS: найдено ссылок:", len(links))
-
-    global HAIFA_NEWS_FIRST_RUN
-
     seen = load_seen_haifa_news()
     if seen is None:
         seen = set()
 
-    # При КАЖДОМ новом запуске сервера публикуем 10 последних,
-    # независимо от сохранённого state-файла.
-    first_run = HAIFA_NEWS_FIRST_RUN
 
-    if first_run:
-        new_links = links[:10]
-        print(
-            "ХАЙФА NEWS: первый запуск — публикую последние:",
-            len(new_links)
-        )
-    else:
-        new_links = [
-            url for url in links
-            if url not in seen
-        ]
+    new_links = [
+        url for url in links
+        if url not in seen
+    ]
 
     if not new_links:
         print("ХАЙФА NEWS: новых публикаций нет")
@@ -4413,12 +4385,6 @@ def check_haifa_news():
                 url,
                 error
             )
-
-    if first_run:
-        # После стартовых 10 вся текущая лента считается просмотренной.
-        seen.update(links)
-        save_seen_haifa_news(seen)
-        HAIFA_NEWS_FIRST_RUN = False
 
     log_line(
         "ХАЙФА NEWS: опубликовано всего:",
@@ -4476,8 +4442,7 @@ def haifa_news_scheduler_loop():
 # НОВОСТИ ИЗРАИЛЯ — JERUSALEM POST RSS
 # =========================================================
 # Используется только официальный RSS Jerusalem Post.
-# При каждом запуске сервера: 10 последних.
-# Далее: раз в час все новые.
+# При любой проверке публикуются только URL, которых нет в локальном seen-файле.
 # Заголовок RSS не изменяется и не переводится.
 # =========================================================
 
@@ -4624,9 +4589,6 @@ def translate_news_to_ru(value, source_lang="en"):
 ISRAEL_NEWS_RSS_URL = "https://www.jpost.com/rss/rssfeedsisraelnews.aspx"
 ISRAEL_NEWS_INTERVAL = 60 * 60
 ISRAEL_NEWS_SEEN_FILE = state_file("israel_news_jpost_seen.json")
-ISRAEL_NEWS_FIRST_RUN = True
-
-
 def load_seen_israel_news():
     if not os.path.exists(ISRAEL_NEWS_SEEN_FILE):
         return set()
@@ -4817,8 +4779,6 @@ def send_israel_news_message(text):
 
 
 def check_israel_news():
-    global ISRAEL_NEWS_FIRST_RUN
-
     items = fetch_israel_news()
 
     if not items:
@@ -4829,25 +4789,16 @@ def check_israel_news():
 
     seen = load_seen_israel_news()
 
-    if ISRAEL_NEWS_FIRST_RUN:
-        to_publish = items[:10]
+    to_publish = [
+        item
+        for item in items
+        if item["url"] not in seen
+    ]
 
-        print(
-            "ИЗРАИЛЬ NEWS: запуск сервера — "
-            f"публикую последние {len(to_publish)}"
-        )
-
-    else:
-        to_publish = [
-            item
-            for item in items
-            if item["url"] not in seen
-        ]
-
-        print(
-            "ИЗРАИЛЬ NEWS: новых публикаций:",
-            len(to_publish)
-        )
+    print(
+        "ИЗРАИЛЬ NEWS: новых публикаций:",
+        len(to_publish)
+    )
 
     if not to_publish:
         return 0
@@ -4894,20 +4845,6 @@ def check_israel_news():
                 item["url"],
                 error
             )
-
-    if ISRAEL_NEWS_FIRST_RUN:
-        # После стартовых 10 вся текущая RSS-лента
-        # считается просмотренной.
-        seen.update(
-            item["url"]
-            for item in items
-        )
-
-        save_seen_israel_news(
-            seen
-        )
-
-        ISRAEL_NEWS_FIRST_RUN = False
 
     log_line(
         "ИЗРАИЛЬ NEWS: опубликовано всего:",
@@ -4977,25 +4914,12 @@ VOA_ECONOMY_RSS_URL = "https://www.voanews.com/api/zyboql-vomx-tpetvmi"
 VOA_ARTS_CULTURE_RSS_URL = "https://www.voanews.com/api/zpbovl-vomx-tpe_vmr"
 
 TECHNOLOGY_NEWS_SEEN_FILE = state_file("technology_news_seen.json")
-TECHNOLOGY_NEWS_FIRST_RUN = True
-
 ECONOMY_NEWS_SEEN_FILE = state_file("economy_news_seen.json")
-ECONOMY_NEWS_FIRST_RUN = True
-
 ARTS_CULTURE_NEWS_SEEN_FILE = state_file("arts_culture_news_seen.json")
-ARTS_CULTURE_NEWS_FIRST_RUN = True
-
 US_ELECTIONS_NEWS_SEEN_FILE = state_file("us_elections_news_seen.json")
-US_ELECTIONS_NEWS_FIRST_RUN = True
-
 SCIENCE_NEWS_SEEN_FILE = state_file("science_news_seen.json")
-SCIENCE_NEWS_FIRST_RUN = True
-
-
 CLIMATE_RSS_URL = "https://www.jpost.com/rss/rssenvironment"
 CLIMATE_NEWS_SEEN_FILE = state_file("climate_news_seen.json")
-CLIMATE_NEWS_FIRST_RUN = True
-
 SPORT_ISRAEL_RSS_URL = "https://www.jpost.com/rss/rssfeedssports.aspx"
 ESPN_TOP_RSS_URL = "https://www.espn.com/espn/rss/news"
 ESPN_NBA_RSS_URL = "https://www.espn.com/espn/rss/nba/news"
@@ -5005,54 +4929,28 @@ ESPN_OLYMPIC_RSS_URL = "https://www.espn.com/espn/rss/oly/news"
 ESPN_COLLEGE_BASKETBALL_RSS_URL = "https://www.espn.com/espn/rss/ncb/news"
 
 ESPN_SPORT_SEEN_FILE = state_file("espn_sport_seen.json")
-ESPN_SPORT_FIRST_RUN = True
 SPORT_NEWS_SEEN_FILE = state_file("sport_news_seen.json")
-SPORT_NEWS_FIRST_RUN = True
-
 CHINA_NEWS_SEEN_FILE = state_file(
     "china_news_seen.json"
 )
-
-CHINA_NEWS_FIRST_RUN = True
-
 IRAN_NEWS_SEEN_FILE = state_file(
     "iran_news_seen.json"
 )
-
-IRAN_NEWS_FIRST_RUN = True
-
 USA_NEWS_SEEN_FILE = state_file(
     "usa_news_seen.json"
 )
-
-USA_NEWS_FIRST_RUN = True
-
 UKRAINE_NEWS_SEEN_FILE = state_file(
     "ukraine_news_seen.json"
 )
-
-UKRAINE_NEWS_FIRST_RUN = True
-
 EUROPE_NEWS_SEEN_FILE = state_file(
     "europe_news_seen.json"
 )
-
-EUROPE_NEWS_FIRST_RUN = True
-
 MIDDLE_EAST_NEWS_SEEN_FILE = state_file(
     "middle_east_news_seen.json"
 )
-
-MIDDLE_EAST_NEWS_FIRST_RUN = True
-
 WORLD_NEWS_SEEN_FILE = state_file(
     "world_news_seen.json"
 )
-
-WORLD_NEWS_FIRST_RUN = True
-
-
-
 class VOATopStoriesParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -5335,8 +5233,6 @@ def send_world_news_message(text):
 
 
 def check_world_news():
-    global WORLD_NEWS_FIRST_RUN
-
     items = fetch_world_news()
 
     if not items:
@@ -5347,25 +5243,16 @@ def check_world_news():
 
     seen = load_seen_world_news()
 
-    if WORLD_NEWS_FIRST_RUN:
-        to_publish = items[:10]
+    to_publish = [
+        item
+        for item in items
+        if item["url"] not in seen
+    ]
 
-        log_line(
-            "WORLD NEWS: запуск сервера — "
-            f"публикую последние {len(to_publish)}"
-        )
-
-    else:
-        to_publish = [
-            item
-            for item in items
-            if item["url"] not in seen
-        ]
-
-        log_line(
-            "WORLD NEWS: новых публикаций:",
-            len(to_publish)
-        )
+    log_line(
+        "WORLD NEWS: новых публикаций:",
+        len(to_publish)
+    )
 
     if not to_publish:
         return 0
@@ -5400,15 +5287,6 @@ def check_world_news():
                 item.get("url", ""),
                 error
             )
-
-    if WORLD_NEWS_FIRST_RUN:
-        seen.update(
-            item["url"]
-            for item in items
-        )
-
-        save_seen_world_news(seen)
-        WORLD_NEWS_FIRST_RUN = False
 
     log_line(
         "WORLD NEWS: опубликовано всего:",
@@ -5564,22 +5442,16 @@ def send_middle_east_news_message(text):
 
 
 def check_middle_east_news():
-    global MIDDLE_EAST_NEWS_FIRST_RUN
-
     log_line("БЛИЖНИЙ ВОСТОК NEWS: запуск проверки")
 
     try:
         items = fetch_middle_east_news()
         seen = load_seen_middle_east_news()
 
-        if MIDDLE_EAST_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("БЛИЖНИЙ ВОСТОК NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -5613,8 +5485,6 @@ def check_middle_east_news():
             published
         )
         log_line("БЛИЖНИЙ ВОСТОК NEWS: проверка завершена")
-
-        MIDDLE_EAST_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -5795,22 +5665,16 @@ def send_europe_news_message(text):
 
 
 def check_europe_news():
-    global EUROPE_NEWS_FIRST_RUN
-
     log_line("ЕВРОПА NEWS: запуск проверки")
 
     try:
         items = fetch_europe_news()
         seen = load_seen_europe_news()
 
-        if EUROPE_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("ЕВРОПА NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -5844,8 +5708,6 @@ def check_europe_news():
             published
         )
         log_line("ЕВРОПА NEWS: проверка завершена")
-
-        EUROPE_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -6026,22 +5888,16 @@ def send_ukraine_news_message(text):
 
 
 def check_ukraine_news():
-    global UKRAINE_NEWS_FIRST_RUN
-
     log_line("УКРАИНА NEWS: запуск проверки")
 
     try:
         items = fetch_ukraine_news()
         seen = load_seen_ukraine_news()
 
-        if UKRAINE_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("УКРАИНА NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -6075,8 +5931,6 @@ def check_ukraine_news():
             published
         )
         log_line("УКРАИНА NEWS: проверка завершена")
-
-        UKRAINE_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -6257,22 +6111,16 @@ def send_usa_news_message(text):
 
 
 def check_usa_news():
-    global USA_NEWS_FIRST_RUN
-
     log_line("США NEWS: запуск проверки")
 
     try:
         items = fetch_usa_news()
         seen = load_seen_usa_news()
 
-        if USA_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("США NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -6306,8 +6154,6 @@ def check_usa_news():
             published
         )
         log_line("США NEWS: проверка завершена")
-
-        USA_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -6488,22 +6334,16 @@ def send_iran_news_message(text):
 
 
 def check_iran_news():
-    global IRAN_NEWS_FIRST_RUN
-
     log_line("ИРАН NEWS: запуск проверки")
 
     try:
         items = fetch_iran_news()
         seen = load_seen_iran_news()
 
-        if IRAN_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("ИРАН NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -6537,8 +6377,6 @@ def check_iran_news():
             published
         )
         log_line("ИРАН NEWS: проверка завершена")
-
-        IRAN_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -6672,6 +6510,12 @@ def check_telegram_commands(offset=None):
         )
 
         chat_id = message["chat"]["id"]
+
+        if command in CONTENT_PACK_TELEGRAM_COMMANDS:
+            publish_content_pack_for_launch(
+                f"TG:{update['update_id']}",
+                f"TELEGRAM {command}"
+            )
 
         try:
             if command == "/services":
@@ -7126,22 +6970,16 @@ def send_china_news_message(text):
 
 
 def check_china_news():
-    global CHINA_NEWS_FIRST_RUN
-
     log_line("КИТАЙ NEWS: запуск проверки")
 
     try:
         items = fetch_china_news()
         seen = load_seen_china_news()
 
-        if CHINA_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("КИТАЙ NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -7175,8 +7013,6 @@ def check_china_news():
             published
         )
         log_line("КИТАЙ NEWS: проверка завершена")
-
-        CHINA_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -7310,6 +7146,12 @@ def check_telegram_commands(offset=None):
         )
 
         chat_id = message["chat"]["id"]
+
+        if command in CONTENT_PACK_TELEGRAM_COMMANDS:
+            publish_content_pack_for_launch(
+                f"TG:{update['update_id']}",
+                f"TELEGRAM {command}"
+            )
 
         try:
             if command == "/weather":
@@ -7659,22 +7501,16 @@ def send_science_news_message(text):
 
 
 def check_science_news():
-    global SCIENCE_NEWS_FIRST_RUN
-
     log_line("НАУКА И ЗДОРОВЬЕ NEWS: запуск проверки")
 
     try:
         items = fetch_science_news()
         seen = load_seen_science_news()
 
-        if SCIENCE_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            print("НАУКА И ЗДОРОВЬЕ NEWS: запуск сервера — публикую последние 10")
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -7708,8 +7544,6 @@ def check_science_news():
             published
         )
         log_line("НАУКА И ЗДОРОВЬЕ NEWS: проверка завершена")
-
-        SCIENCE_NEWS_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -7843,6 +7677,12 @@ def check_telegram_commands(offset=None):
         )
 
         chat_id = message["chat"]["id"]
+
+        if command in CONTENT_PACK_TELEGRAM_COMMANDS:
+            publish_content_pack_for_launch(
+                f"TG:{update['update_id']}",
+                f"TELEGRAM {command}"
+            )
 
         try:
             if command == "/weather":
@@ -8155,16 +7995,11 @@ def send_climate_news_message(text):
 
 
 def check_climate_news():
-    global CLIMATE_NEWS_FIRST_RUN
     log_line("КЛИМАТ NEWS: запуск проверки")
     try:
         items = fetch_climate_news()
         seen = load_seen_climate_news()
-        if CLIMATE_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line("КЛИМАТ NEWS: запуск сервера — публикую последние", len(to_publish))
-        else:
-            to_publish = [item for item in items if item.get("url") not in seen]
+        to_publish = [item for item in items if item.get("url") not in seen]
         published = 0
         for index, item in enumerate(reversed(to_publish), start=1):
             message = make_climate_news_text(item)
@@ -8178,7 +8013,6 @@ def check_climate_news():
         save_seen_climate_news(seen)
         log_line("КЛИМАТ NEWS: опубликовано всего:", published)
         log_line("КЛИМАТ NEWS: проверка завершена")
-        CLIMATE_NEWS_FIRST_RUN = False
         return published
     except Exception as exc:
         log_line("КЛИМАТ NEWS — ОШИБКА:", exc)
@@ -8267,19 +8101,11 @@ def send_sport_news_message(text):
 
 
 def check_sport_news():
-    global SPORT_NEWS_FIRST_RUN
     log_line("СПОРТ NEWS: запуск проверки")
     try:
         items = fetch_sport_news()
         seen = load_seen_sport_news()
-        if SPORT_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line(
-                "СПОРТ ИЗРАИЛЯ NEWS: запуск сервера — публикую последние",
-                len(to_publish)
-            )
-        else:
-            to_publish = [item for item in items if item.get("url") not in seen]
+        to_publish = [item for item in items if item.get("url") not in seen]
         published = 0
         for index, item in enumerate(reversed(to_publish), start=1):
             message = make_sport_news_text(item)
@@ -8297,7 +8123,6 @@ def check_sport_news():
         save_seen_sport_news(seen)
         log_line("СПОРТ NEWS: опубликовано всего:", published)
         log_line("СПОРТ NEWS: проверка завершена")
-        SPORT_NEWS_FIRST_RUN = False
         return published
     except Exception as exc:
         log_line("СПОРТ NEWS — ОШИБКА:", exc)
@@ -8382,45 +8207,17 @@ def send_espn_sport_message(text):
 
 
 def check_espn_sport():
-    global ESPN_SPORT_FIRST_RUN
-
     log_line("ESPN SPORT: запуск проверки")
 
     try:
         items = fetch_espn_sport()
         seen = load_seen_espn_sport()
 
-        if ESPN_SPORT_FIRST_RUN:
-            # Стартовая выдача:
-            # Top Headlines — 10;
-            # NBA, Soccer, Tennis, Olympic Sports, College Basketball — по 1.
-            to_publish = []
-            categories = [
-                ("TOP HEADLINES", 10),
-                ("NBA", 1),
-                ("SOCCER", 1),
-                ("TENNIS", 1),
-                ("OLYMPIC SPORTS", 1),
-                ("COLLEGE BASKETBALL", 1),
-            ]
-            for category, limit in categories:
-                selected = [
-                    item for item in items
-                    if item.get("category") == category
-                ][:limit]
-                to_publish.extend(selected)
-
-            log_line(
-                "ESPN SPORT: запуск сервера — публикаций:",
-                len(to_publish)
-            )
-        else:
-            # После первого запуска в каждый час :00 публикуются ВСЕ новые
-            # материалы из всех шести ESPN RSS.
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        # При каждой проверке публикуются только новые URL из всех шести ESPN RSS.
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -8448,7 +8245,6 @@ def check_espn_sport():
 
         log_line("ESPN SPORT: опубликовано всего:", published)
         log_line("ESPN SPORT: проверка завершена")
-        ESPN_SPORT_FIRST_RUN = False
         return published
 
     except Exception as exc:
@@ -8520,7 +8316,6 @@ def _send_voa_category_message(text):
 
 
 def check_technology_news():
-    global TECHNOLOGY_NEWS_FIRST_RUN
     label = "ТЕХНОЛОГИИ"
     log_line(f"{label} NEWS: запуск проверки")
 
@@ -8528,11 +8323,7 @@ def check_technology_news():
         items = _fetch_voa_category_news(VOA_TECHNOLOGY_RSS_URL, label)
         seen = _load_seen_simple_news(TECHNOLOGY_NEWS_SEEN_FILE, label)
 
-        if TECHNOLOGY_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line(f"{label} NEWS: запуск сервера — публикую последние", len(to_publish))
-        else:
-            to_publish = [item for item in items if item.get("url") not in seen]
+        to_publish = [item for item in items if item.get("url") not in seen]
 
         published = 0
         for index, item in enumerate(reversed(to_publish), start=1):
@@ -8550,7 +8341,6 @@ def check_technology_news():
                 seen.add(item["url"])
 
         _save_seen_simple_news(TECHNOLOGY_NEWS_SEEN_FILE, seen, label)
-        TECHNOLOGY_NEWS_FIRST_RUN = False
         log_line(f"{label} NEWS: опубликовано всего:", published)
         log_line(f"{label} NEWS: проверка завершена")
         return published
@@ -8561,7 +8351,6 @@ def check_technology_news():
 
 
 def check_economy_news():
-    global ECONOMY_NEWS_FIRST_RUN
     label = "ЭКОНОМИКА"
     log_line(f"{label} NEWS: запуск проверки")
 
@@ -8569,11 +8358,7 @@ def check_economy_news():
         items = _fetch_voa_category_news(VOA_ECONOMY_RSS_URL, label)
         seen = _load_seen_simple_news(ECONOMY_NEWS_SEEN_FILE, label)
 
-        if ECONOMY_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line(f"{label} NEWS: запуск сервера — публикую последние", len(to_publish))
-        else:
-            to_publish = [item for item in items if item.get("url") not in seen]
+        to_publish = [item for item in items if item.get("url") not in seen]
 
         published = 0
         for index, item in enumerate(reversed(to_publish), start=1):
@@ -8591,7 +8376,6 @@ def check_economy_news():
                 seen.add(item["url"])
 
         _save_seen_simple_news(ECONOMY_NEWS_SEEN_FILE, seen, label)
-        ECONOMY_NEWS_FIRST_RUN = False
         log_line(f"{label} NEWS: опубликовано всего:", published)
         log_line(f"{label} NEWS: проверка завершена")
         return published
@@ -8603,7 +8387,6 @@ def check_economy_news():
 
 
 def check_arts_culture_news():
-    global ARTS_CULTURE_NEWS_FIRST_RUN
     label = "КУЛЬТУРА"
     log_line(f"{label} NEWS: запуск проверки")
 
@@ -8617,17 +8400,10 @@ def check_arts_culture_news():
             label
         )
 
-        if ARTS_CULTURE_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line(
-                f"{label} NEWS: запуск сервера — публикую последние",
-                len(to_publish)
-            )
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -8655,8 +8431,6 @@ def check_arts_culture_news():
                 item.get("url", "")
             )
 
-        # Запоминаем весь текущий RSS, чтобы после стартовых
-        # 10 не вывалить старый хвост на следующем :00.
         for item in items:
             if item.get("url"):
                 seen.add(item["url"])
@@ -8666,9 +8440,6 @@ def check_arts_culture_news():
             seen,
             label
         )
-
-        ARTS_CULTURE_NEWS_FIRST_RUN = False
-
         log_line(
             f"{label} NEWS: опубликовано всего:",
             published
@@ -8728,8 +8499,6 @@ def _is_us_elections_item(item):
 
 
 def check_us_elections_news():
-    global US_ELECTIONS_NEWS_FIRST_RUN
-
     label = "ВЫБОРЫ В США"
     log_line(f"{label} NEWS: запуск проверки")
 
@@ -8749,17 +8518,10 @@ def check_us_elections_news():
             label
         )
 
-        if US_ELECTIONS_NEWS_FIRST_RUN:
-            to_publish = items[:10]
-            log_line(
-                f"{label} NEWS: запуск сервера — публикую последние",
-                len(to_publish)
-            )
-        else:
-            to_publish = [
-                item for item in items
-                if item.get("url") not in seen
-            ]
+        to_publish = [
+            item for item in items
+            if item.get("url") not in seen
+        ]
 
         published = 0
 
@@ -8795,9 +8557,6 @@ def check_us_elections_news():
             seen,
             label
         )
-
-        US_ELECTIONS_NEWS_FIRST_RUN = False
-
         log_line(
             f"{label} NEWS: опубликовано всего:",
             published
@@ -9109,6 +8868,85 @@ def _telegram_send_photo_file(image_path, caption=None):
     return body["result"]["message_id"]
 
 
+
+# =========================================================
+# ОДИН ЗАПУСК = ОДИН КОНТЕНТ-ПАКЕТ
+# | 3.9.1
+# =========================================================
+
+CONTENT_PACK_LAUNCH_LOCK = threading.RLock()
+CONTENT_PACK_DONE_LAUNCHES = set()
+
+
+def publish_content_pack_for_launch(launch_id, reason):
+    """
+    Для одного логического запуска публикует контент-пакет ровно один раз.
+
+    launch_id одинаковый для всех блоков одного запуска.
+    Поэтому:
+      - старт сервера -> 1 КП на весь старт;
+      - автообновление :00 -> 1 КП на все блоки;
+      - Бен-Гурион :30 -> 1 КП;
+      - одна ручная команда -> 1 КП.
+    """
+    launch_id = str(launch_id or "").strip()
+
+    if not launch_id:
+        raise ValueError("Пустой launch_id для контент-пакета")
+
+    with CONTENT_PACK_LAUNCH_LOCK:
+        if launch_id in CONTENT_PACK_DONE_LAUNCHES:
+            return False
+
+        # Ставим отметку ДО публикации, чтобы параллельные потоки
+        # одного запуска не выпустили второй КП.
+        CONTENT_PACK_DONE_LAUNCHES.add(launch_id)
+
+        # Держим только последние ключи, чтобы set не рос бесконечно.
+        if len(CONTENT_PACK_DONE_LAUNCHES) > 500:
+            CONTENT_PACK_DONE_LAUNCHES.clear()
+            CONTENT_PACK_DONE_LAUNCHES.add(launch_id)
+
+    log_line(
+        "КОНТЕНТ-ПАКЕТ: один запуск — один КП",
+        f"launch_id={launch_id}",
+        f"reason={reason}"
+    )
+
+    publish_content_pack(reason)
+    return True
+
+
+def periodic_launch_id(now=None):
+    """
+    Один общий ключ для одного периодического запуска.
+    :00 объединяет погоду / новости / время / валюты / Бен-Гурион.
+    :30 используется отдельным запуском Бен-Гуриона.
+    """
+    if now is None:
+        now = datetime.now(TZ)
+
+    return "AUTO:" + now.strftime("%Y-%m-%d %H:%M")
+
+
+CONTENT_PACK_TELEGRAM_COMMANDS = {
+    "/weather",
+    "/arrivals",
+    "/departures",
+    "/time",
+    "/flights",
+    "/news",
+    "/middleeast",
+    "/europe",
+    "/ukraine",
+    "/usa",
+    "/iran",
+    "/worldnews",
+    "/israelnews",
+    "/rates",
+}
+
+
 def run_all_news_checks():
     sections = [
         ("ХАЙФА", check_haifa_news),
@@ -9134,12 +8972,6 @@ def run_all_news_checks():
         try:
             log_line(
                 f"NEWS DISPATCHER: {section_name} — запуск проверки"
-            )
-
-            # Контент-пакет выходит ВСЕГДА и ДО проверки/выдачи новостей.
-            # Наличие новых публикаций на это больше не влияет.
-            publish_content_pack(
-                section_name
             )
 
             published = checker()
@@ -9194,6 +9026,12 @@ def flights_scheduler_loop():
 
         try:
             log_line("БЕН-ГУРИОН: запуск обновления")
+
+            publish_content_pack_for_launch(
+                periodic_launch_id(target),
+                "АВТООБНОВЛЕНИЕ"
+            )
+
             update_flight_board()
             log_line("БЕН-ГУРИОН: обновление завершено")
         except Exception as error:
@@ -9228,6 +9066,12 @@ def main():
 
     log_line(
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
+    )
+
+    # Один запуск сервера = один КП, самым первым действием обновления.
+    publish_content_pack_for_launch(
+        "SERVER_START",
+        "СТАРТ СЕРВЕРА"
     )
 
     # При запуске обновляем постоянные сервисные посты; новых простыней не создаём.
@@ -9331,6 +9175,19 @@ def main():
             != last_weather_key
         ):
             try:
+                # Один периодический запуск :00 = один КП,
+                # независимо от числа обновляемых блоков.
+                publish_content_pack_for_launch(
+                    periodic_launch_id(
+                        now.replace(
+                            minute=0,
+                            second=0,
+                            microsecond=0
+                        )
+                    ),
+                    "АВТООБНОВЛЕНИЕ"
+                )
+
                 update_weather()
                 last_weather_key = (
                     current_weather_key
@@ -9452,24 +9309,40 @@ if __name__ == "__main__":
             len(sys.argv) > 1
             and sys.argv[1].lower() == "now"
         ):
+            publish_content_pack_for_launch(
+                "CMD:NOW",
+                "CMD NOW"
+            )
             update_weather()
 
         elif (
             len(sys.argv) > 1
             and sys.argv[1].lower() == "flights"
         ):
+            publish_content_pack_for_launch(
+                "CMD:FLIGHTS",
+                "CMD FLIGHTS"
+            )
             update_flight_board()
 
         elif (
             len(sys.argv) > 1
             and sys.argv[1].lower() == "rates"
         ):
+            publish_content_pack_for_launch(
+                "CMD:RATES",
+                "CMD RATES"
+            )
             update_rates()
 
         elif (
             len(sys.argv) > 1
             and sys.argv[1].lower() == "news"
         ):
+            publish_content_pack_for_launch(
+                "CMD:NEWS",
+                "CMD NEWS"
+            )
             check_haifa_news()
 
         else:
