@@ -1,8 +1,9 @@
 # =========================================================
-# УНИКАЛЬНОСТЬ НОВОСТЕЙ ПО ЛОКАЛЬНЫМ *_seen.json; КОНТЕНТ-ПАКЕТ ПРИ КАЖДОМ ОБНОВЛЕНИИ; MM.DD - только 1 раз!
-# | 3.9.1
+# ХАЙФА: 15 РУБРИК × 3 ПОСЛЕДНИЕ НОВОСТИ БЕЗ УЧЕТА SEEN; 08/12/16/20
+# | 3.9.5
 # =========================================================
 
+BOT_BUILD = "3.9.5-haifa-last3-per-category-20260831"
 
 
 
@@ -4069,9 +4070,28 @@ def update_time_post():
 # =========================================================
 
 HAIFA_NEWS_URL = "https://www.haifa.muni.il/haifa-news/"
-HAIFA_NEWS_INTERVAL = 60 * 60
+HAIFA_NEWS_SOURCES = (
+    ("главная", HAIFA_NEWS_URL),
+    ("טוב לדעת", HAIFA_NEWS_URL + "?cat=108"),
+    ("תכנון ובניה", HAIFA_NEWS_URL + "?cat=106"),
+    ("תרבות", HAIFA_NEWS_URL + "?cat=18"),
+    ("קהילה ורווחה", HAIFA_NEWS_URL + "?cat=127"),
+    ("ביטחון וחירום", HAIFA_NEWS_URL + "?cat=362"),
+    ("חינוך", HAIFA_NEWS_URL + "?cat=16"),
+    ("תשתיות וניקיון", HAIFA_NEWS_URL + "?cat=462"),
+    ("עסקים", HAIFA_NEWS_URL + "?cat=107"),
+    ("ספורט", HAIFA_NEWS_URL + "?cat=19"),
+    ("תחבורה וחניה", HAIFA_NEWS_URL + "?cat=120"),
+    ("דברים שכדאי לעשות בחיפה", HAIFA_NEWS_URL + "?cat=368"),
+    ("ים וחופים", HAIFA_NEWS_URL + "?cat=451"),
+    ("היסטוריה, דת והנצחה", HAIFA_NEWS_URL + "?cat=412"),
+    ("טבע וסביבה", HAIFA_NEWS_URL + "?cat=375"),
+    ("אמנות ותערוכות", HAIFA_NEWS_URL + "?cat=374"),
+)
+HAIFA_NEWS_HOURS = (8, 12, 16, 20)
 HAIFA_NEWS_SEEN_FILE = state_file("haifa_news_seen_v3.json")
 HAIFA_NEWS_TRANSLATION_CACHE_FILE = state_file("haifa_news_translation_cache.json")
+HAIFA_NEWS_BASELINE_FILE = state_file("haifa_news_16_sources_baseline_v1.txt")
 class HaifaNewsLinksParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -4139,20 +4159,81 @@ def load_seen_haifa_news():
 
 
 def save_seen_haifa_news(seen):
+    # Категорийные страницы содержат большой архив. Нельзя обрезать seen
+    # до 1000 случайных элементов set: иначе старые URL снова станут "новыми".
     with open(HAIFA_NEWS_SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(seen)[-1000:], f, ensure_ascii=False, indent=2)
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
+
+
+def haifa_news_baseline_ready():
+    return os.path.exists(HAIFA_NEWS_BASELINE_FILE)
+
+
+def save_haifa_news_baseline():
+    with open(HAIFA_NEWS_BASELINE_FILE, "w", encoding="utf-8") as f:
+        f.write(datetime.now(TZ).isoformat())
 
 
 def fetch_haifa_news_links():
-    response = requests.get(
-        HAIFA_NEWS_URL,
-        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "he,en;q=0.8"},
-        timeout=30,
+    links = []
+    seen_links = set()
+    successful_sources = 0
+    failed_sources = []
+    source_links_map = {}
+
+    for source_name, page_url in HAIFA_NEWS_SOURCES:
+        try:
+            response = requests.get(
+                page_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept-Language": "he,en;q=0.8",
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            parser = HaifaNewsLinksParser()
+            parser.feed(response.text)
+
+            source_links = list(parser.links)
+            source_links_map[source_name] = source_links
+            added = 0
+            for url in source_links:
+                if url not in seen_links:
+                    seen_links.add(url)
+                    links.append(url)
+                    added += 1
+
+            successful_sources += 1
+            print(
+                "ХАЙФА NEWS SOURCE:",
+                source_name,
+                f"найдено={len(source_links)}",
+                f"новых_уникальных={added}",
+                page_url,
+            )
+
+        except Exception as error:
+            failed_sources.append((source_name, page_url, error))
+            print(
+                "ХАЙФА NEWS SOURCE — ОШИБКА:",
+                source_name,
+                page_url,
+                repr(error),
+            )
+
+    if successful_sources == 0:
+        raise RuntimeError("не удалось прочитать ни один источник новостей Хайфы")
+
+    print(
+        "ХАЙФА NEWS SOURCES:",
+        f"успешно={successful_sources}/{len(HAIFA_NEWS_SOURCES)}",
+        f"ошибок={len(failed_sources)}",
+        f"уникальных_URL={len(links)}",
     )
-    response.raise_for_status()
-    parser = HaifaNewsLinksParser()
-    parser.feed(response.text)
-    return parser.links
+
+    return links, successful_sources, failed_sources, source_links_map
 
 
 def fetch_haifa_article_title(url):
@@ -4283,13 +4364,17 @@ def translate_hebrew_title_to_ru(title):
     return title
 
 
-def make_haifa_news_text(title, url):
+def make_haifa_news_text(title, url, rubric_name=None):
     title_ru = translate_hebrew_title_to_ru(title)
     title_ru = html.escape(str(title_ru))
     safe_url = html.escape(str(url), quote=True)
+    rubric_line = ""
+    if rubric_name:
+        rubric_line = f"Рубрика: {html.escape(str(rubric_name))}\n\n"
 
     return (
         "🏙 ХАЙФА — НОВОСТИ МЭРИИ\n\n"
+        f"{rubric_line}"
         f"{title_ru}\n\n"
         "Source: Haifa Municipality\n"
         f'<a href="{safe_url}">Оригинал</a>\n\n'
@@ -4325,13 +4410,95 @@ def send_haifa_news_message(text):
     return result["result"]["message_id"]
 
 
+def publish_haifa_latest_three_per_category(source_links_map, seen):
+    """
+    Публикует по три верхние (самые свежие) статьи из каждой из 15 рубрик.
+    Главная страница не считается рубрикой. Проверка seen намеренно не применяется.
+    После успешной отправки URL всё равно сохраняется в seen, чтобы обычная
+    логика новых публикаций в том же цикле не отправила эту статью повторно.
+    """
+    published = 0
+
+    for source_name, _page_url in HAIFA_NEWS_SOURCES[1:]:
+        source_links = source_links_map.get(source_name, [])
+        latest_three = source_links[:3]
+
+        print(
+            "ХАЙФА NEWS LAST3:",
+            source_name,
+            f"к_публикации={len(latest_three)}",
+        )
+
+        for position, url in enumerate(latest_three, start=1):
+            try:
+                title = fetch_haifa_article_title(url)
+                send_haifa_news_message(
+                    make_haifa_news_text(
+                        title,
+                        url,
+                        rubric_name=source_name,
+                    )
+                )
+
+                seen.add(url)
+                save_seen_haifa_news(seen)
+                published += 1
+
+                print(
+                    "ХАЙФА NEWS LAST3: опубликовано",
+                    source_name,
+                    f"{position}/{len(latest_three)}:",
+                    url,
+                )
+
+                time.sleep(1.1)
+
+            except Exception as error:
+                print(
+                    "ХАЙФА NEWS LAST3 — ОШИБКА СТАТЬИ:",
+                    source_name,
+                    url,
+                    error,
+                )
+
+    log_line(
+        "ХАЙФА NEWS LAST3: опубликовано всего:",
+        published
+    )
+    return published
+
+
 def check_haifa_news():
-    links = fetch_haifa_news_links()
-    print("ХАЙФА NEWS: найдено ссылок:", len(links))
+    links, successful_sources, failed_sources, source_links_map = fetch_haifa_news_links()
+    print("ХАЙФА NEWS: найдено уникальных ссылок:", len(links))
     seen = load_seen_haifa_news()
     if seen is None:
         seen = set()
 
+    # Отдельно и без учета seen публикуем 3 самые свежие статьи
+    # из каждой из 15 тематических рубрик.
+    forced_published = publish_haifa_latest_three_per_category(
+        source_links_map,
+        seen,
+    )
+
+    # Существующая baseline-логика оставлена без изменения.
+    if not haifa_news_baseline_ready():
+        if successful_sources != len(HAIFA_NEWS_SOURCES):
+            raise RuntimeError(
+                "первичная база 16 источников не создана: "
+                f"прочитано {successful_sources}/{len(HAIFA_NEWS_SOURCES)}"
+            )
+
+        seen.update(links)
+        save_seen_haifa_news(seen)
+        save_haifa_news_baseline()
+        print(
+            "ХАЙФА NEWS: создана первичная база 16 источников; "
+            f"URL в seen={len(seen)}; обычных публикаций=0; "
+            f"LAST3 публикаций={forced_published}"
+        )
+        return forced_published
 
     new_links = [
         url for url in links
@@ -4339,8 +4506,11 @@ def check_haifa_news():
     ]
 
     if not new_links:
-        print("ХАЙФА NEWS: новых публикаций нет")
-        return 0
+        print(
+            "ХАЙФА NEWS: новых обычных публикаций нет; "
+            f"LAST3 публикаций={forced_published}"
+        )
+        return forced_published
 
     # Лента обычно идёт от новых к старым.
     # Публикуем от старых к новым, чтобы самая свежая
@@ -4349,7 +4519,7 @@ def check_haifa_news():
     published = 0
 
     print(
-        "ХАЙФА NEWS: к публикации:",
+        "ХАЙФА NEWS: обычных новых к публикации:",
         len(new_links)
     )
 
@@ -4373,67 +4543,26 @@ def check_haifa_news():
                 url
             )
 
-            # Не отправляем десятки постов одним мгновенным залпом.
             if index < len(new_links):
                 time.sleep(1.1)
 
         except Exception as error:
-            # Неуспешный URL НЕ добавляется в seen —
-            # значит, бот попробует его снова через час.
             print(
                 "ХАЙФА NEWS — ОШИБКА СТАТЬИ:",
                 url,
                 error
             )
 
+    total_published = forced_published + published
     log_line(
         "ХАЙФА NEWS: опубликовано всего:",
-        published
+        total_published,
+        f"(LAST3={forced_published}, новых={published})"
     )
 
-    return published
+    return total_published
 
 
-def haifa_news_scheduler_loop():
-    first_cycle = True
-
-    while True:
-        if not first_cycle:
-            now = datetime.now(TZ)
-
-            next_run = (
-                now.replace(
-                    minute=0,
-                    second=0,
-                    microsecond=0
-                )
-                + timedelta(hours=1)
-            )
-
-            log_line(
-                "ХАЙФА NEWS: следующее обновление",
-                next_run.strftime("%d.%m.%Y %H:%M:%S")
-            )
-
-            time.sleep(
-                max(
-                    0,
-                    (next_run - now).total_seconds()
-                )
-            )
-
-        first_cycle = False
-
-        try:
-            log_line("ХАЙФА NEWS: запуск проверки")
-            check_haifa_news()
-            log_line("ХАЙФА NEWS: проверка завершена")
-
-        except Exception as error:
-            log_line(
-                "ХАЙФА NEWS — ОШИБКА:",
-                error
-            )
 
 # =========================================================
 
@@ -7048,310 +7177,6 @@ def china_news_scheduler_loop():
         check_china_news()
 
 
-def world_news_scheduler_loop():
-    first_cycle = True
-
-    while True:
-        if not first_cycle:
-            now = datetime.now(TZ)
-
-            next_run = (
-                now.replace(
-                    minute=0,
-                    second=0,
-                    microsecond=0
-                )
-                + timedelta(hours=1)
-            )
-
-            log_line(
-                "WORLD NEWS: следующее обновление",
-                next_run.strftime("%d.%m.%Y %H:%M:%S")
-            )
-
-            time.sleep(
-                max(
-                    0,
-                    (next_run - now).total_seconds()
-                )
-            )
-
-        first_cycle = False
-
-        try:
-            log_line("WORLD NEWS: запуск проверки")
-            check_world_news()
-            log_line("WORLD NEWS: проверка завершена")
-
-        except Exception as error:
-            log_line(
-                "WORLD NEWS — ОШИБКА:",
-                error
-            )
-
-
-def send_private_reply(chat_id, text):
-    response = _telegram_send_post(
-        data={
-            "chat_id": chat_id,
-            "text": text,
-        },
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-
-def check_telegram_commands(offset=None):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/getUpdates"
-    )
-
-    params = {
-        "timeout": 0,
-        "limit": 20
-    }
-
-    if offset is not None:
-        params["offset"] = offset
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=10
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("ok"):
-        return offset
-
-    for update in data.get("result", []):
-        offset = update["update_id"] + 1
-
-        message = update.get("message")
-
-        if not message:
-            continue
-
-        command = (
-            message.get("text", "")
-            .strip()
-            .lower()
-            .split()[0]
-            if message.get("text")
-            else ""
-        )
-
-        chat_id = message["chat"]["id"]
-
-        if command in CONTENT_PACK_TELEGRAM_COMMANDS:
-            publish_content_pack_for_launch(
-                f"TG:{update['update_id']}",
-                f"TELEGRAM {command}"
-            )
-
-        try:
-            if command == "/weather":
-                weather_message_id = update_weather()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Погода реально обновлена. "
-                        f"Пост #{weather_message_id}. "
-                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
-                    )
-                )
-
-            elif command == "/arrivals":
-                update_flight_board()
-
-                send_private_reply(
-                    chat_id,
-                    "Прилёты обновлены в постоянных постах. Новых постов не создано."
-                )
-
-            elif command == "/departures":
-                update_flight_board()
-
-                send_private_reply(
-                    chat_id,
-                    "Вылеты обновлены в постоянных постах. Новых постов не создано."
-                )
-
-            elif command == "/time":
-                update_time_post()
-
-                send_private_reply(
-                    chat_id,
-                    "Мировое время обновлено в постоянном посте. Новый пост не создан."
-                )
-
-            elif command == "/flights":
-                update_flight_board()
-                send_private_reply(
-                    chat_id,
-                    "Табло Бен-Гуриона обновлено."
-                )
-
-            elif command == "/news":
-                published = check_haifa_news()
-                send_private_reply(
-                    chat_id,
-                    f"Новости Хайфы проверены. Опубликовано новых: {published}."
-                )
-
-            elif command == "/middleeast":
-                published = check_middle_east_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ближнего Востока проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/europe":
-                published = check_europe_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Европы проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/ukraine":
-                published = check_ukraine_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Украины проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/usa":
-                published = check_usa_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости США проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/iran":
-                published = check_china_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ирана проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/worldnews":
-                published = check_world_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Мировые новости проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/israelnews":
-                published = check_israel_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Израиля проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/rates":
-                rates_message_id = update_rates()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Курсы обновлены. "
-                        f"Пост #{rates_message_id}. "
-                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
-                    )
-                )
-
-        except Exception as error:
-            print(
-                "ОШИБКА TELEGRAM-КОМАНДЫ:",
-                command,
-                error
-            )
-
-            try:
-                send_private_reply(
-                    chat_id,
-                    f"Ошибка выполнения {command}"
-                )
-            except Exception:
-                pass
-
-    return offset
-
-
-# =========================================================
-# 4. ПЛАНИРОВЩИК
-# =========================================================
-# Оба сервиса независимы.
-#
-# Погода:
-#   проверяется раз в минуту;
-#   автоматически обновляется при смене часа.
-#
-# Бен-Гурион:
-#   НЕ проверяется минутным циклом;
-#   отдельный таймер запускает обновление только в :00 и :30.
-#
-# Ошибка одного сервиса НЕ останавливает второй.
-# =========================================================
-
-def weather_schedule_key(now):
-    return now.strftime(
-        "%Y-%m-%d %H"
-    )
-
-
-def next_flights_run(now=None):
-    """
-    Следующий запуск табло Бен-Гуриона:
-    строго ближайшие :00 или :30.
-    """
-    if now is None:
-        now = datetime.now(TZ)
-
-    if now.minute < 30:
-        target = now.replace(
-            minute=30,
-            second=0,
-            microsecond=0
-        )
-    else:
-        target = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-    return target
 
 
 
@@ -7579,310 +7404,6 @@ def science_news_scheduler_loop():
         check_science_news()
 
 
-def world_news_scheduler_loop():
-    first_cycle = True
-
-    while True:
-        if not first_cycle:
-            now = datetime.now(TZ)
-
-            next_run = (
-                now.replace(
-                    minute=0,
-                    second=0,
-                    microsecond=0
-                )
-                + timedelta(hours=1)
-            )
-
-            log_line(
-                "WORLD NEWS: следующее обновление",
-                next_run.strftime("%d.%m.%Y %H:%M:%S")
-            )
-
-            time.sleep(
-                max(
-                    0,
-                    (next_run - now).total_seconds()
-                )
-            )
-
-        first_cycle = False
-
-        try:
-            log_line("WORLD NEWS: запуск проверки")
-            check_world_news()
-            log_line("WORLD NEWS: проверка завершена")
-
-        except Exception as error:
-            log_line(
-                "WORLD NEWS — ОШИБКА:",
-                error
-            )
-
-
-def send_private_reply(chat_id, text):
-    response = _telegram_send_post(
-        data={
-            "chat_id": chat_id,
-            "text": text,
-        },
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-
-def check_telegram_commands(offset=None):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/getUpdates"
-    )
-
-    params = {
-        "timeout": 0,
-        "limit": 20
-    }
-
-    if offset is not None:
-        params["offset"] = offset
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=10
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("ok"):
-        return offset
-
-    for update in data.get("result", []):
-        offset = update["update_id"] + 1
-
-        message = update.get("message")
-
-        if not message:
-            continue
-
-        command = (
-            message.get("text", "")
-            .strip()
-            .lower()
-            .split()[0]
-            if message.get("text")
-            else ""
-        )
-
-        chat_id = message["chat"]["id"]
-
-        if command in CONTENT_PACK_TELEGRAM_COMMANDS:
-            publish_content_pack_for_launch(
-                f"TG:{update['update_id']}",
-                f"TELEGRAM {command}"
-            )
-
-        try:
-            if command == "/weather":
-                weather_message_id = update_weather()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Погода реально обновлена. "
-                        f"Пост #{weather_message_id}. "
-                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
-                    )
-                )
-
-            elif command == "/arrivals":
-                update_flight_board()
-
-                send_private_reply(
-                    chat_id,
-                    "Прилёты обновлены в постоянных постах. Новых постов не создано."
-                )
-
-            elif command == "/departures":
-                update_flight_board()
-
-                send_private_reply(
-                    chat_id,
-                    "Вылеты обновлены в постоянных постах. Новых постов не создано."
-                )
-
-            elif command == "/time":
-                update_time_post()
-
-                send_private_reply(
-                    chat_id,
-                    "Мировое время обновлено в постоянном посте. Новый пост не создан."
-                )
-
-            elif command == "/flights":
-                update_flight_board()
-                send_private_reply(
-                    chat_id,
-                    "Табло Бен-Гуриона обновлено."
-                )
-
-            elif command == "/news":
-                published = check_haifa_news()
-                send_private_reply(
-                    chat_id,
-                    f"Новости Хайфы проверены. Опубликовано новых: {published}."
-                )
-
-            elif command == "/middleeast":
-                published = check_middle_east_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ближнего Востока проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/europe":
-                published = check_europe_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Европы проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/ukraine":
-                published = check_ukraine_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Украины проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/usa":
-                published = check_usa_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости США проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/iran":
-                published = check_science_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Ирана проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-            elif command == "/worldnews":
-                published = check_world_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Мировые новости проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/israelnews":
-                published = check_israel_news()
-
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Новости Израиля проверены. "
-                        f"Опубликовано новых: {published}."
-                    )
-                )
-
-            elif command == "/rates":
-                rates_message_id = update_rates()
-                send_private_reply(
-                    chat_id,
-                    (
-                        "Курсы обновлены. "
-                        f"Пост #{rates_message_id}. "
-                        f"{datetime.now(TZ).strftime('%H:%M:%S')}"
-                    )
-                )
-
-        except Exception as error:
-            print(
-                "ОШИБКА TELEGRAM-КОМАНДЫ:",
-                command,
-                error
-            )
-
-            try:
-                send_private_reply(
-                    chat_id,
-                    f"Ошибка выполнения {command}"
-                )
-            except Exception:
-                pass
-
-    return offset
-
-
-# =========================================================
-# 4. ПЛАНИРОВЩИК
-# =========================================================
-# Оба сервиса независимы.
-#
-# Погода:
-#   проверяется раз в минуту;
-#   автоматически обновляется при смене часа.
-#
-# Бен-Гурион:
-#   НЕ проверяется минутным циклом;
-#   отдельный таймер запускает обновление только в :00 и :30.
-#
-# Ошибка одного сервиса НЕ останавливает второй.
-# =========================================================
-
-def weather_schedule_key(now):
-    return now.strftime(
-        "%Y-%m-%d %H"
-    )
-
-
-def next_flights_run(now=None):
-    """
-    Следующий запуск табло Бен-Гуриона:
-    строго ближайшие :00 или :30.
-    """
-    if now is None:
-        now = datetime.now(TZ)
-
-    if now.minute < 30:
-        target = now.replace(
-            minute=30,
-            second=0,
-            microsecond=0
-        )
-    else:
-        target = (
-            now.replace(
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-            + timedelta(hours=1)
-        )
-
-    return target
 
 
 
@@ -8949,7 +8470,6 @@ CONTENT_PACK_TELEGRAM_COMMANDS = {
 
 def run_all_news_checks():
     sections = [
-        ("ХАЙФА", check_haifa_news),
         ("ИЗРАИЛЬ", check_israel_news),
         ("WORLD", check_world_news),
         ("ТЕХНОЛОГИИ", check_technology_news),
@@ -8993,7 +8513,7 @@ def all_news_scheduler_loop():
     Реальное часовое расписание новостей теперь контролирует main().
     """
     start_news_dispatch("старт сервера")
-    log_next_news_update(now)
+    log_next_news_update(datetime.now(TZ))
     while True:
         time.sleep(3600)
 
@@ -9055,6 +8575,15 @@ def rates_schedule_key(now):
     return None
 
 
+def haifa_news_schedule_key(now):
+    if now.hour in HAIFA_NEWS_HOURS:
+        return now.strftime(
+            "%Y-%m-%d %H"
+        )
+
+    return None
+
+
 def time_schedule_key(now):
     return now.strftime(
         "%Y-%m-%d %H"
@@ -9067,6 +8596,7 @@ def main():
     log_line(
         "ДИСПЕТЧЕР ЗАПУСКАЕТСЯ..."
     )
+    log_line("BUILD:", BOT_BUILD)
 
     # Один запуск сервера = один КП, самым первым действием обновления.
     publish_content_pack_for_launch(
@@ -9099,7 +8629,18 @@ def main():
     flights_thread.start()
 
 
-    # Новости запускаются главным диспетчером.
+    # Хайфа проверяется отдельно: при старте и затем в 08 / 12 / 16 / 20.
+    try:
+        log_line("ХАЙФА NEWS: запуск проверки при старте")
+        check_haifa_news()
+        log_line("ХАЙФА NEWS: стартовая проверка завершена")
+    except Exception as error:
+        print(
+            "ХАЙФА NEWS — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
+    # Остальные новости запускаются главным диспетчером.
     # Стартовая проверка выполняется сразу.
     start_news_dispatch("старт сервера")
 
@@ -9129,6 +8670,10 @@ def main():
         rates_schedule_key(now)
     )
 
+    last_haifa_news_key = (
+        haifa_news_schedule_key(now)
+    )
+
     last_time_key = (
         time_schedule_key(now)
     )
@@ -9147,7 +8692,7 @@ def main():
         "Бен-Гурион: редактируются 5 постоянных постов в :00 и :30."
     )
     print(
-        "Новости Хайфы: проверка раз в час."
+        "Новости Хайфы: проверка при старте и в 08:00, 12:00, 16:00, 20:00."
     )
     print(
         "Новости: главный диспетчер; старт сразу, затем проверка при каждом переходе на новый час (:00)."
@@ -9218,6 +8763,31 @@ def main():
             except Exception as error:
                 print(
                     "ВАЛЮТЫ — ОШИБКА:",
+                    error
+                )
+
+        # ---------------------------------------------
+        # ХАЙФА — ПРОВЕРКА НОВОСТЕЙ 08 / 12 / 16 / 20
+        # ---------------------------------------------
+        current_haifa_news_key = (
+            haifa_news_schedule_key(now)
+        )
+
+        if (
+            current_haifa_news_key is not None
+            and current_haifa_news_key
+            != last_haifa_news_key
+        ):
+            try:
+                log_line("ХАЙФА NEWS: запуск проверки по расписанию")
+                check_haifa_news()
+                last_haifa_news_key = (
+                    current_haifa_news_key
+                )
+                log_line("ХАЙФА NEWS: проверка по расписанию завершена")
+            except Exception as error:
+                print(
+                    "ХАЙФА NEWS — ОШИБКА:",
                     error
                 )
 
