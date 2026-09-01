@@ -1,10 +1,10 @@
 # =========================================================
 # ХАЙФА: публикуются только новые новости по seen; 08/12/16/20
-# МИРОВЫЕ: единственный VOA-блок — русская VOA (Голос Америки); старые рубричные VOA/RSS-блоки удалены
-# | 3.10.1
+# VOA RU: ГЛАВНАЯ → BREAKING; НОВОСТИ → МИРОВЫЕ; два независимых потока/seen
+# | 3.10.4
 # =========================================================
 
-BOT_BUILD = "3.10.1-haifa-new-only-20260831"
+BOT_BUILD = "3.10.4-voa-breaking-vazhno-20260901"
 
 
 
@@ -4966,6 +4966,8 @@ def israel_news_scheduler_loop():
 # =========================================================
 
 VOA_RUSSIAN_URL = "https://www.golosameriki.com/"
+VOA_RUSSIAN_NEWS_URL = "https://www.golosameriki.com/z/8492"
+VOA_BREAKING_SEEN_FILE = state_file("voa_breaking_seen.json")
 
 # Остальные URL ниже относятся к САМОСТОЯТЕЛЬНЫМ рубрикам бота
 # (Ближний Восток, Европа, Украина, США и т. д.) и не участвуют
@@ -5098,7 +5100,7 @@ def save_seen_world_news(seen):
 
 def fetch_world_news():
     response = requests.get(
-        VOA_RUSSIAN_URL,
+        VOA_RUSSIAN_NEWS_URL,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 "
@@ -5177,6 +5179,90 @@ def fetch_world_news():
         )
 
     return items
+
+
+def load_seen_voa_breaking():
+    if not os.path.exists(VOA_BREAKING_SEEN_FILE):
+        return set()
+    try:
+        with open(VOA_BREAKING_SEEN_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if isinstance(data, list):
+            return set(data)
+    except Exception as error:
+        log_line("BREAKING / VOA — ошибка state:", error)
+    return set()
+
+
+def save_seen_voa_breaking(seen):
+    try:
+        with open(VOA_BREAKING_SEEN_FILE, "w", encoding="utf-8") as file:
+            json.dump(list(seen)[-5000:], file, ensure_ascii=False, indent=2)
+    except Exception as error:
+        log_line("BREAKING / VOA — ошибка записи state:", error)
+
+
+def fetch_voa_breaking_news():
+    response = requests.get(
+        VOA_RUSSIAN_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    parser = VOARussianNewsParser()
+    parser.feed(response.text)
+    items = []
+    seen_urls = set()
+    for item in parser.items:
+        title = clean_news_text(item.get("title"))
+        url = str(item.get("url") or "").strip()
+        if not title or len(title) < 12 or not url.startswith("https://www.golosameriki.com/a/"):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        items.append({"title": title, "url": url, "domain": "Голос Америки"})
+    log_line("BREAKING / ГОЛОС АМЕРИКИ RU / ГЛАВНАЯ: найдено:", len(items))
+    if not items:
+        raise RuntimeError("Главная Голоса Америки не вернула материалы")
+    return items
+
+
+def make_voa_breaking_text(item):
+    safe_title = html.escape(clean_news_text(item.get("title", "")))
+    safe_url = html.escape(item.get("url", ""), quote=True)
+    return (
+        "⚡ BREAKING | ВАЖНО ⚡\n\n"
+        f"{safe_title}\n\n"
+        "Источник: Голос Америки\n"
+        f'<a href="{safe_url}">Оригинал</a>\n\n'
+        "@ne_zaika"
+    )
+
+
+def check_voa_breaking_news():
+    items = fetch_voa_breaking_news()
+    seen = load_seen_voa_breaking()
+    to_publish = [item for item in items if item["url"] not in seen]
+    log_line("BREAKING / VOA: новых публикаций:", len(to_publish))
+    published = 0
+    for index, item in enumerate(reversed(to_publish), start=1):
+        try:
+            send_world_news_message(make_voa_breaking_text(item))
+            seen.add(item["url"])
+            save_seen_voa_breaking(seen)
+            published += 1
+            log_line("BREAKING / VOA: опубликовано", f"{index}/{len(to_publish)}:", item["url"])
+            if index < len(to_publish):
+                time.sleep(1.1)
+        except Exception as error:
+            log_line("BREAKING / VOA — ОШИБКА СТАТЬИ:", item.get("url", ""), error)
+    return published
 
 
 def make_world_news_text(item):
@@ -5532,6 +5618,14 @@ def check_telegram_commands(offset=None):
                     chat_id,
                     f"Новости Хайфы проверены. Опубликовано новых: {published}."
                 )
+
+            elif command == "/worldnews":
+                published = check_world_news()
+                send_private_reply(chat_id, f"Мировые новости VOA проверены. Опубликовано новых: {published}.")
+
+            elif command == "/breaking":
+                published = check_voa_breaking_news()
+                send_private_reply(chat_id, f"BREAKING VOA проверен. Опубликовано новых: {published}.")
 
 
         except Exception as error:
@@ -6416,6 +6510,7 @@ CONTENT_PACK_TELEGRAM_COMMANDS = {
 
 
     "/worldnews",
+    "/breaking",
     "/israelnews",
     "/rates",
 }
@@ -6424,7 +6519,8 @@ CONTENT_PACK_TELEGRAM_COMMANDS = {
 def run_all_news_checks():
     sections = [
         ("ИЗРАИЛЬ", check_israel_news),
-        ("WORLD", check_world_news),
+        ("BREAKING / VOA MAIN", check_voa_breaking_news),
+        ("WORLD / VOA NEWS", check_world_news),
 
 
 
