@@ -1,10 +1,11 @@
 # =========================================================
 # ХАЙФА: публикуются только новые новости по seen; 08/12/16/20
 # VOA RU: ГЛАВНАЯ → BREAKING; НОВОСТИ → МИРОВЫЕ; два независимых потока/seen
-# | 3.10.4
+# | 3.10.7
+# ESPN: адаптивный EN -> RU перевод заголовков с сохранением смысла
 # =========================================================
 
-BOT_BUILD = "3.10.4-voa-breaking-vazhno-20260901"
+BOT_BUILD = "3.10.6-netanya-first-run-publish-20260901"
 
 
 
@@ -4494,6 +4495,221 @@ def check_haifa_news():
 
 
 # =========================================================
+# НЕТАНИЯ — НОВОСТИ МЭРИИ
+# =========================================================
+# ВАЖНО: проверка Нетании выполняется ТОЛЬКО при запуске сервера.
+# В периодическом диспетчере и Telegram-командах этой проверки нет.
+# Проверка выполняется только при запуске сервера.
+# На первом запуске публикуются все найденные на главной новости Нетании,
+# затем они сохраняются в seen. На следующих запусках публикуются только новые URL.
+# =========================================================
+
+NETANYA_NEWS_URL = "https://www.netanya.muni.il/"
+NETANYA_NEWS_SEEN_FILE = state_file("netanya_news_seen_v1.json")
+NETANYA_NEWS_BASELINE_FILE = state_file("netanya_news_baseline_v1.txt")
+# 3.10.7: один раз принудительно публикуем текущие новости Нетании,
+# даже если предыдущая версия уже ошибочно записала их в seen.
+NETANYA_FORCE_CURRENT_ONCE_FILE = state_file(
+    "netanya_news_force_current_once_3_10_7.txt"
+)
+
+
+class NetanyaNewsLinksParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        url = urljoin(NETANYA_NEWS_URL, href)
+        clean = url.split("#", 1)[0].split("?", 1)[0]
+        low = clean.lower()
+        if not low.startswith("https://www.netanya.muni.il/"):
+            return
+        if "/news/pages/" not in low:
+            return
+        tail = low.rsplit("/", 1)[-1]
+        if tail in ("default.aspx", "allreports.aspx", ""):
+            return
+        if clean not in self.links:
+            self.links.append(clean)
+
+
+class NetanyaArticleTitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.og_title = None
+        self.in_title = False
+        self.title_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = {str(k).lower(): v for k, v in attrs}
+        if tag.lower() == "title":
+            self.in_title = True
+        if tag.lower() == "meta":
+            prop = str(attrs.get("property") or attrs.get("name") or "").lower()
+            content = str(attrs.get("content") or "").strip()
+            if prop in ("og:title", "twitter:title") and content and not self.og_title:
+                self.og_title = content
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title and str(data).strip():
+            self.title_parts.append(str(data).strip())
+
+    def get_title(self):
+        title = self.og_title or " ".join(self.title_parts).strip()
+        for suffix in (" | עיריית נתניה", " - עיריית נתניה", " : עיריית נתניה"):
+            if title.endswith(suffix):
+                title = title[:-len(suffix)].rstrip()
+        return title or "Новая публикация муниципалитета Нетании"
+
+
+def load_seen_netanya_news():
+    if not os.path.exists(NETANYA_NEWS_SEEN_FILE):
+        return None
+    try:
+        with open(NETANYA_NEWS_SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(str(x) for x in data) if isinstance(data, list) else set()
+    except Exception as error:
+        print("НЕТАНИЯ NEWS — ошибка state:", error)
+        return set()
+
+
+def save_seen_netanya_news(seen):
+    with open(NETANYA_NEWS_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
+
+
+def netanya_news_baseline_ready():
+    return os.path.exists(NETANYA_NEWS_BASELINE_FILE)
+
+
+def save_netanya_news_baseline():
+    with open(NETANYA_NEWS_BASELINE_FILE, "w", encoding="utf-8") as f:
+        f.write(datetime.now(TZ).isoformat())
+
+
+def fetch_netanya_news_links():
+    response = requests.get(
+        NETANYA_NEWS_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "he,en;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    parser = NetanyaNewsLinksParser()
+    parser.feed(response.text)
+    print("НЕТАНИЯ NEWS: найдено ссылок:", len(parser.links))
+    return list(parser.links)
+
+
+def fetch_netanya_article_title(url):
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "he,en;q=0.8",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    parser = NetanyaArticleTitleParser()
+    parser.feed(response.text)
+    return parser.get_title()
+
+
+def make_netanya_news_text(title, url):
+    # Используем уже существующий переводчик заголовков Хайфы:
+    # он переводит HE -> RU и ведёт локальный cache.
+    title_ru = translate_hebrew_title_to_ru(title)
+    title_ru = html.escape(str(title_ru))
+    safe_url = html.escape(str(url), quote=True)
+    return (
+        "🏙 НЕТАНИЯ — НОВОСТИ МЭРИИ\n\n"
+        f"{title_ru}\n\n"
+        "Source: Netanya Municipality\n"
+        f'<a href="{safe_url}">Оригинал</a>\n\n'
+        "@ne_zaika"
+    )
+
+
+def check_netanya_news_startup():
+    links = fetch_netanya_news_links()
+    seen = load_seen_netanya_news()
+    if seen is None:
+        seen = set()
+
+    force_current_once = not os.path.exists(
+        NETANYA_FORCE_CURRENT_ONCE_FILE
+    )
+
+    if force_current_once:
+        # 3.10.7: предыдущая версия могла уже записать эти URL в seen,
+        # не опубликовав их. Один раз вынимаем текущую главную из seen
+        # и реально отправляем все найденные публикации.
+        seen.difference_update(links)
+        save_seen_netanya_news(seen)
+        new_links = list(links)
+        print(
+            "НЕТАНИЯ NEWS: принудительная публикация текущей ленты; "
+            f"к публикации={len(new_links)}"
+        )
+    else:
+        new_links = [url for url in links if url not in seen]
+
+    if not new_links:
+        print("НЕТАНИЯ NEWS: новых публикаций нет")
+        return 0
+
+    # Главная обычно показывает свежие карточки раньше старых.
+    # Публикуем в обратном порядке, чтобы самая свежая осталась последней.
+    new_links = list(reversed(new_links))
+    published = 0
+
+    for index, url in enumerate(new_links, start=1):
+        try:
+            title = fetch_netanya_article_title(url)
+            send_haifa_news_message(make_netanya_news_text(title, url))
+            seen.add(url)
+            save_seen_netanya_news(seen)
+            published += 1
+            print(
+                "НЕТАНИЯ NEWS: опубликовано",
+                f"{index}/{len(new_links)}:",
+                url,
+            )
+            if index < len(new_links):
+                time.sleep(1.1)
+        except Exception as error:
+            print("НЕТАНИЯ NEWS — ОШИБКА СТАТЬИ:", url, error)
+
+    if force_current_once:
+        with open(
+            NETANYA_FORCE_CURRENT_ONCE_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(datetime.now(TZ).isoformat())
+
+    if not netanya_news_baseline_ready():
+        save_netanya_news_baseline()
+
+    log_line("НЕТАНИЯ NEWS: опубликовано всего:", published)
+    return published
+
+
+# =========================================================
 
 
 # =========================================================
@@ -6027,9 +6243,54 @@ def fetch_espn_sport():
     return all_items
 
 
+def adapt_espn_title_to_ru(title):
+    """
+    ESPN EN -> RU: адаптивный новостной перевод заголовка.
+
+    Основа — общий EN->RU переводчик проекта. После перевода убираем
+    типичные буквальные англоязычные конструкции ESPN и приводим
+    результат к нормальной русской новостной подаче, не меняя факты,
+    имена, числа, счёт и смысл исходного headline.
+    """
+    source = clean_news_text(title)
+    if not source:
+        return ""
+
+    translated = clean_news_text(
+        translate_news_to_ru(source, "en")
+    )
+    if not translated:
+        return source
+
+    # Нормализация наиболее частых конструкций спортивных заголовков.
+    replacements = (
+        (r"(?i)^источники\s*:\s*", "По данным источников: "),
+        (r"(?i)^отчет\s*:\s*", "По данным СМИ: "),
+        (r"(?i)^сообщается\s*:\s*", ""),
+        (r"(?i)\bплей-оффы\b", "плей-офф"),
+        (r"(?i)\bплей офф\b", "плей-офф"),
+        (r"(?i)\bнба\b", "НБА"),
+        (r"(?i)\bнфл\b", "НФЛ"),
+        (r"(?i)\bмлб\b", "MLB"),
+        (r"(?i)\bнхл\b", "НХЛ"),
+    )
+    for pattern, replacement in replacements:
+        translated = re.sub(pattern, replacement, translated)
+
+    translated = re.sub(r"\s+([,.:;!?])", r"\1", translated)
+    translated = re.sub(r"\s{2,}", " ", translated).strip()
+
+    # Нормальный регистр первой буквы после возможной перестройки.
+    if translated:
+        translated = translated[0].upper() + translated[1:]
+
+    return translated or source
+
+
 def make_espn_sport_text(item):
-    # ВАЖНО: ESPN RSS headline публикуется без перевода и без изменения.
-    safe_title = html.escape(item.get("title", ""))
+    # ESPN: адаптивный EN -> RU перевод headline; факты и смысл сохраняются.
+    title_ru = adapt_espn_title_to_ru(item.get("title", ""))
+    safe_title = html.escape(title_ru)
     safe_url = html.escape(item.get("url", ""), quote=True)
     category = html.escape(item.get("category", ""))
 
@@ -6686,6 +6947,17 @@ def main():
     except Exception as error:
         print(
             "ХАЙФА NEWS — ОШИБКА ПРИ ЗАПУСКЕ:",
+            error
+        )
+
+    # Нетания проверяется ТОЛЬКО один раз — при запуске сервера.
+    try:
+        log_line("НЕТАНИЯ NEWS: запуск проверки при старте")
+        check_netanya_news_startup()
+        log_line("НЕТАНИЯ NEWS: стартовая проверка завершена")
+    except Exception as error:
+        print(
+            "НЕТАНИЯ NEWS — ОШИБКА ПРИ ЗАПУСКЕ:",
             error
         )
 
